@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ActionParams,
+  CurrentStorageInfo,
   DownloadExecutePayload,
   FirmwareInfo,
   RockusbDevice,
@@ -49,6 +50,10 @@ export function readChipInfo() {
 
 export function runAction(action: string, params?: ActionParams) {
   return invoke<string>("run_action", { action, params: params ?? null });
+}
+
+export function getCurrentStorage() {
+  return invoke<CurrentStorageInfo>("get_current_storage");
 }
 
 export function isToolBusy() {

@@ -1,6 +1,7 @@
 use serde::Serialize;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,6 +38,12 @@ pub struct ToolInfo {
 pub struct CommandResult {
     pub success: bool,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrentStorageInfo {
+    pub no: u32,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -711,6 +718,13 @@ enum SpawnedTool {
     },
 }
 
+struct SpawnedToolWithStdin {
+    child: Child,
+    stdout: std::process::ChildStdout,
+    stderr: Option<std::process::ChildStderr>,
+    stdin: std::process::ChildStdin,
+}
+
 /// Unix 用 script PTY 实时输出；Windows 用 pipe（ConPTY 会丢失输出且中文路径易失败）。
 fn spawn_tool_child(
     tool_path: &Path,
@@ -764,13 +778,14 @@ fn try_spawn_with_script(
     })
 }
 
-fn spawn_tool_pipe(
+fn spawn_tool_pipe_with_stdin(
     tool_path: &Path,
     work_dir: &Path,
     tool_args: &[String],
-) -> Result<SpawnedTool, String> {
+) -> Result<SpawnedToolWithStdin, String> {
     let mut cmd = Command::new(tool_path);
     cmd.current_dir(work_dir)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(tool_args);
@@ -778,15 +793,183 @@ fn spawn_tool_pipe(
     #[cfg(windows)]
     apply_windows_hidden(&mut cmd);
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to start upgrade_tool: {e}"))?;
+    let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to read stdout")?;
     let stderr = child.stderr.take();
-    Ok(SpawnedTool::Pipe {
+    Ok(SpawnedToolWithStdin {
         child,
         stdout,
         stderr,
+        stdin,
     })
+}
+
+#[cfg(unix)]
+fn try_spawn_with_script_stdin(
+    tool_path: &Path,
+    work_dir: &Path,
+    tool_args: &[String],
+) -> Result<SpawnedToolWithStdin, String> {
+    let mut cmd = Command::new("script");
+    cmd.current_dir(work_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "macos")]
+    {
+        cmd.arg("-F").arg("-q").arg("/dev/null").arg(tool_path);
+        cmd.args(tool_args);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        cmd.arg("-q")
+            .arg("-f")
+            .arg("-c")
+            .arg(shell_join(tool_path, tool_args))
+            .arg("/dev/null");
+    }
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to read stdout")?;
+    let stderr = child.stderr.take();
+    Ok(SpawnedToolWithStdin {
+        child,
+        stdout,
+        stderr,
+        stdin,
+    })
+}
+
+#[cfg(unix)]
+fn spawn_ssd_query_child(
+    tool_path: &Path,
+    work_dir: &Path,
+    tool_args: &[String],
+) -> Result<SpawnedToolWithStdin, String> {
+    try_spawn_with_script_stdin(tool_path, work_dir, tool_args)
+        .or_else(|_| spawn_tool_pipe_with_stdin(tool_path, work_dir, tool_args))
+}
+
+#[cfg(windows)]
+fn spawn_ssd_query_child(
+    tool_path: &Path,
+    work_dir: &Path,
+    tool_args: &[String],
+) -> Result<SpawnedToolWithStdin, String> {
+    spawn_tool_pipe_with_stdin(tool_path, work_dir, tool_args)
+}
+
+fn spawn_tool_pipe(
+    tool_path: &Path,
+    work_dir: &Path,
+    tool_args: &[String],
+) -> Result<SpawnedTool, String> {
+    let spawned = spawn_tool_pipe_with_stdin(tool_path, work_dir, tool_args)?;
+    Ok(SpawnedTool::Pipe {
+        child: spawned.child,
+        stdout: spawned.stdout,
+        stderr: spawned.stderr,
+    })
+}
+
+fn parse_current_storage(output: &str) -> Option<CurrentStorageInfo> {
+    for line in output.lines() {
+        let line = strip_ansi(line);
+        if !line.contains("(*)") {
+            continue;
+        }
+        let no: u32 = parse_field(&line, &["No"])?.parse().ok()?;
+        let idx = line.find("(*)")?;
+        let before = &line[..idx];
+        let name = before.split_whitespace().last()?.trim();
+        if name.is_empty() {
+            continue;
+        }
+        return Some(CurrentStorageInfo {
+            no,
+            name: name.to_string(),
+        });
+    }
+    None
+}
+
+/// `SSD` without a storage index is interactive; use PTY + stdin `q` to exit promptly.
+fn run_ssd_query_sync(
+    app: &AppHandle,
+    tool_path: &Path,
+    work_dir: &Path,
+    device_id: Option<&str>,
+) -> Result<CurrentStorageInfo, String> {
+    let args = vec![String::from("SSD")];
+    let tool_args = tool_argv(device_id, &args);
+    emit_log(app, &format!("> upgrade_tool {}", tool_args.join(" ")), false);
+
+    let SpawnedToolWithStdin {
+        mut child,
+        stdout,
+        stderr,
+        stdin,
+    } = spawn_ssd_query_child(tool_path, work_dir, &tool_args)?;
+
+    let stdin = Arc::new(std::sync::Mutex::new(stdin));
+    let stdin_writer = stdin.clone();
+    let app_out = app.clone();
+
+    let stdout_handle = thread::spawn(move || -> Result<String, String> {
+        let reader = BufReader::new(stdout);
+        let mut full = String::new();
+        let mut quit_sent = false;
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            emit_log(&app_out, &line, false);
+            full.push_str(&line);
+            full.push('\n');
+
+            if !quit_sent {
+                let lower = line.to_ascii_lowercase();
+                if line.contains("(*)") || lower.contains("input no to switch") {
+                    if let Ok(mut guard) = stdin_writer.lock() {
+                        let _ = guard.write_all(b"q\n");
+                        let _ = guard.flush();
+                    }
+                    quit_sent = true;
+                }
+            }
+        }
+
+        if !quit_sent {
+            if let Ok(mut guard) = stdin_writer.lock() {
+                let _ = guard.write_all(b"q\n");
+                let _ = guard.flush();
+            }
+        }
+
+        Ok(full)
+    });
+
+    let stderr_handle = stderr.map(|stderr| {
+        let app_err = app.clone();
+        thread::spawn(move || read_tool_stream(stderr, app_err, false))
+    });
+
+    let _ = wait_for_child(&mut child, Duration::from_secs(10))?;
+
+    let mut output = stdout_handle
+        .join()
+        .map_err(|_| "stdout reader thread panicked".to_string())??;
+    if let Some(handle) = stderr_handle {
+        output.push_str(&handle.join().map_err(|_| "stderr reader thread panicked".to_string())??);
+    }
+
+    parse_current_storage(&output)
+        .ok_or_else(|| "Get current storage failed: no active storage marker (*) found".to_string())
 }
 
 fn run_tool_sync(
@@ -1153,6 +1336,17 @@ mod tests {
         let output = "List of rockusb connected(0)\n";
         assert!(parse_devices(output).is_empty());
     }
+
+    #[test]
+    fn parse_current_storage_from_ssd_output() {
+        let output = "List of supported storage\n\
+            No=1    FLASH\n\
+            No=6    SPINAND(*)\n\
+            Input No to switch,Quit press <Q>:\n";
+        let info = super::parse_current_storage(output).unwrap();
+        assert_eq!(info.no, 6);
+        assert_eq!(info.name, "SPINAND");
+    }
 }
 
 fn ensure_not_busy(state: &State<'_, AppState>) -> Result<(), String> {
@@ -1445,7 +1639,7 @@ fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, St
         "测试设备" => vec!["TD".into()],
         "重启设备" => vec!["RD".into()],
         "进入Maskrom" => vec!["RD".into(), "3".into()],
-        "切换存储" | "获取当前存储" => {
+        "切换存储" => {
             let index = params
                 .start_sector
                 .clone()
@@ -1479,6 +1673,32 @@ fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, St
         "切换USB3" => vec!["SSD".into()],
         _ => return Err(format!("Unsupported action: {}", action_label_en(action))),
     })
+}
+
+#[tauri::command]
+pub async fn get_current_storage(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CurrentStorageInfo, String> {
+    ensure_not_busy(&state)?;
+    set_busy(&state, true)?;
+
+    let device = state
+        .selected_device
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let device_arg = device_arg_for_tool(&state, device);
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (tool_path, work_dir) = resolve_tool_paths(&app)?;
+        run_ssd_query_sync(&app, &tool_path, &work_dir, device_arg.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let _ = set_busy(&state, false);
+    result
 }
 
 #[tauri::command]

@@ -39,6 +39,11 @@ export interface ActionParams {
   output_path?: string;
 }
 
+export interface CurrentStorageInfo {
+  no: number;
+  name: string;
+}
+
 export interface ToolLogEvent {
   text: string;
   level: LogLevel;

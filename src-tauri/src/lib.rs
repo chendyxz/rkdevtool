@@ -5,8 +5,8 @@ mod upgrade_tool;
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
 use state::AppState;
 use upgrade_tool::{
-    download_boot, download_execute, get_tool_info, is_tool_busy, list_devices, partition_list,
-    read_chip_info, run_action, select_device, upgrade_firmware,
+    download_boot, download_execute, get_current_storage, get_tool_info, is_tool_busy,
+    list_devices, partition_list, read_chip_info, run_action, select_device, upgrade_firmware,
 };
 
 #[tauri::command]
@@ -38,6 +38,7 @@ pub fn run() {
             parse_firmware,
             extract_firmware,
             read_chip_info,
+            get_current_storage,
             run_action,
             is_tool_busy,
         ])

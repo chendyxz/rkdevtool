@@ -79,6 +79,8 @@ export default {
     extractSuccess: "解包固件成功: {path}",
     exportImageTodo: "导出镜像暂未实现",
     downloadBinHint: "提示: 若下载长时间无响应，请改用 MiniLoaderAll.bin 等 Loader 文件",
+    currentStorageTitle: "当前存储",
+    currentStorageMessage: "当前存储类型: {name}",
   },
   action: {
     readFlashId: "读取FlashID",

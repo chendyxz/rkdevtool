@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { open } from "@tauri-apps/plugin-dialog";
+import { message, open } from "@tauri-apps/plugin-dialog";
 import AppButton from "../ui/AppButton.vue";
 import PathField from "../ui/PathField.vue";
 import { useAppState } from "../../composables/useAppState";
@@ -43,7 +43,7 @@ async function browseFile(target: "boot" | "firmware") {
 }
 
 function actionParams(command: string) {
-  if (command === "切换存储" || command === "获取当前存储") {
+  if (command === "切换存储") {
     return { start_sector: String(selectedStorage.value + 1) };
   }
   if (command === "擦除扇区") {
@@ -79,6 +79,25 @@ async function exportSerialLog(labelKey: string) {
   }
 }
 
+async function getCurrentStorageAction(labelKey: string) {
+  try {
+    const result = await run(() => toolApi.getCurrentStorage(), logText(labelKey));
+    if (!result) return;
+
+    const index = result.no - 1;
+    if (index >= 0 && index < storageItems.length) {
+      selectedStorage.value = index;
+    }
+
+    await message(t("advanced.currentStorageMessage", { name: result.name }), {
+      title: t("advanced.currentStorageTitle"),
+      kind: "info",
+    });
+  } catch (err) {
+    appendLog(String(err), "error");
+  }
+}
+
 async function runAction(command: string, labelKey: string) {
   if (command === "导出镜像") {
     appendLog(logText("advanced.exportImageTodo"), "error");
@@ -87,6 +106,11 @@ async function runAction(command: string, labelKey: string) {
 
   if (command === "导出串口日志") {
     await exportSerialLog(labelKey);
+    return;
+  }
+
+  if (command === "获取当前存储") {
+    await getCurrentStorageAction(labelKey);
     return;
   }
 

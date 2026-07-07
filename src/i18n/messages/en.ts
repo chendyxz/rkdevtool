@@ -79,6 +79,8 @@ export default {
     extractSuccess: "Firmware extracted: {path}",
     exportImageTodo: "Export image is not implemented yet",
     downloadBinHint: "Tip: if download hangs, try MiniLoaderAll.bin or another Loader file",
+    currentStorageTitle: "Current storage",
+    currentStorageMessage: "Current storage type: {name}",
   },
   action: {
     readFlashId: "Read Flash ID",
