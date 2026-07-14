@@ -1,13 +1,16 @@
 pub mod firmware;
+mod device_ops;
+mod devices;
 mod state;
 mod upgrade_tool;
 
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
 use state::AppState;
 use upgrade_tool::{
-    download_boot, download_execute, get_current_storage, get_tool_info, is_tool_busy,
-    list_devices, partition_list, read_chip_info, run_action, select_device, upgrade_firmware,
+    download_execute, get_tool_info, is_tool_busy, list_devices, partition_list, run_action,
+    select_device, upgrade_firmware,
 };
+use device_ops::{download_boot, get_current_storage, read_chip_info};
 
 #[tauri::command]
 fn parse_firmware(path: String) -> Result<FirmwareInfo, String> {
@@ -27,6 +30,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            devices::start_hotplug_watcher(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_tool_info,
             list_devices,

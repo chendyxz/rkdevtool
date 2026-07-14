@@ -1,7 +1,6 @@
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,7 +9,6 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::state::AppState;
 
 const EVENT_TOOL_LOG: &str = "tool-log";
-const EVENT_DEVICES: &str = "devices-updated";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogPayload {
@@ -543,34 +541,6 @@ fn read_tool_stream(
     Ok(reader.finish())
 }
 
-fn devices_to_snapshot(devices: &[RockusbDevice]) -> Vec<crate::state::DeviceSnapshot> {
-    devices
-        .iter()
-        .map(|d| (d.location_id.clone(), d.mode.clone(), d.label.clone()))
-        .collect()
-}
-
-fn snapshot_to_devices(snapshots: &[crate::state::DeviceSnapshot]) -> Vec<RockusbDevice> {
-    snapshots
-        .iter()
-        .map(|(location_id, mode, label)| RockusbDevice {
-            location_id: location_id.clone(),
-            mode: mode.clone(),
-            label: label.clone(),
-        })
-        .collect()
-}
-
-fn store_devices(state: &State<'_, AppState>, devices: &[RockusbDevice]) -> Result<(), String> {
-    *state.last_devices.lock().map_err(|e| e.to_string())? = devices_to_snapshot(devices);
-    Ok(())
-}
-
-fn cached_devices(state: &State<'_, AppState>) -> Result<Vec<RockusbDevice>, String> {
-    let cache = state.last_devices.lock().map_err(|e| e.to_string())?;
-    Ok(snapshot_to_devices(&cache))
-}
-
 fn output_has_error(output: &str) -> bool {
     for line in output.lines() {
         let line = strip_ansi(line);
@@ -718,13 +688,6 @@ enum SpawnedTool {
     },
 }
 
-struct SpawnedToolWithStdin {
-    child: Child,
-    stdout: std::process::ChildStdout,
-    stderr: Option<std::process::ChildStderr>,
-    stdin: std::process::ChildStdin,
-}
-
 /// Unix 用 script PTY 实时输出；Windows 用 pipe（ConPTY 会丢失输出且中文路径易失败）。
 fn spawn_tool_child(
     tool_path: &Path,
@@ -778,14 +741,14 @@ fn try_spawn_with_script(
     })
 }
 
-fn spawn_tool_pipe_with_stdin(
+fn spawn_tool_pipe(
     tool_path: &Path,
     work_dir: &Path,
     tool_args: &[String],
-) -> Result<SpawnedToolWithStdin, String> {
+) -> Result<SpawnedTool, String> {
     let mut cmd = Command::new(tool_path);
     cmd.current_dir(work_dir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(tool_args);
@@ -796,180 +759,13 @@ fn spawn_tool_pipe_with_stdin(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start upgrade_tool: {e}"))?;
-    let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to read stdout")?;
     let stderr = child.stderr.take();
-    Ok(SpawnedToolWithStdin {
-        child,
-        stdout,
-        stderr,
-        stdin,
-    })
-}
-
-#[cfg(unix)]
-fn try_spawn_with_script_stdin(
-    tool_path: &Path,
-    work_dir: &Path,
-    tool_args: &[String],
-) -> Result<SpawnedToolWithStdin, String> {
-    let mut cmd = Command::new("script");
-    cmd.current_dir(work_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(target_os = "macos")]
-    {
-        cmd.arg("-F").arg("-q").arg("/dev/null").arg(tool_path);
-        cmd.args(tool_args);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        cmd.arg("-q")
-            .arg("-f")
-            .arg("-c")
-            .arg(shell_join(tool_path, tool_args))
-            .arg("/dev/null");
-    }
-
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
-    let stdout = child.stdout.take().ok_or("Failed to read stdout")?;
-    let stderr = child.stderr.take();
-    Ok(SpawnedToolWithStdin {
-        child,
-        stdout,
-        stderr,
-        stdin,
-    })
-}
-
-#[cfg(unix)]
-fn spawn_ssd_query_child(
-    tool_path: &Path,
-    work_dir: &Path,
-    tool_args: &[String],
-) -> Result<SpawnedToolWithStdin, String> {
-    try_spawn_with_script_stdin(tool_path, work_dir, tool_args)
-        .or_else(|_| spawn_tool_pipe_with_stdin(tool_path, work_dir, tool_args))
-}
-
-#[cfg(windows)]
-fn spawn_ssd_query_child(
-    tool_path: &Path,
-    work_dir: &Path,
-    tool_args: &[String],
-) -> Result<SpawnedToolWithStdin, String> {
-    spawn_tool_pipe_with_stdin(tool_path, work_dir, tool_args)
-}
-
-fn spawn_tool_pipe(
-    tool_path: &Path,
-    work_dir: &Path,
-    tool_args: &[String],
-) -> Result<SpawnedTool, String> {
-    let spawned = spawn_tool_pipe_with_stdin(tool_path, work_dir, tool_args)?;
     Ok(SpawnedTool::Pipe {
-        child: spawned.child,
-        stdout: spawned.stdout,
-        stderr: spawned.stderr,
-    })
-}
-
-fn parse_current_storage(output: &str) -> Option<CurrentStorageInfo> {
-    for line in output.lines() {
-        let line = strip_ansi(line);
-        if !line.contains("(*)") {
-            continue;
-        }
-        let no: u32 = parse_field(&line, &["No"])?.parse().ok()?;
-        let idx = line.find("(*)")?;
-        let before = &line[..idx];
-        let name = before.split_whitespace().last()?.trim();
-        if name.is_empty() {
-            continue;
-        }
-        return Some(CurrentStorageInfo {
-            no,
-            name: name.to_string(),
-        });
-    }
-    None
-}
-
-/// `SSD` without a storage index is interactive; use PTY + stdin `q` to exit promptly.
-fn run_ssd_query_sync(
-    app: &AppHandle,
-    tool_path: &Path,
-    work_dir: &Path,
-    device_id: Option<&str>,
-) -> Result<CurrentStorageInfo, String> {
-    let args = vec![String::from("SSD")];
-    let tool_args = tool_argv(device_id, &args);
-    emit_log(app, &format!("> upgrade_tool {}", tool_args.join(" ")), false);
-
-    let SpawnedToolWithStdin {
-        mut child,
+        child,
         stdout,
         stderr,
-        stdin,
-    } = spawn_ssd_query_child(tool_path, work_dir, &tool_args)?;
-
-    let stdin = Arc::new(std::sync::Mutex::new(stdin));
-    let stdin_writer = stdin.clone();
-    let app_out = app.clone();
-
-    let stdout_handle = thread::spawn(move || -> Result<String, String> {
-        let reader = BufReader::new(stdout);
-        let mut full = String::new();
-        let mut quit_sent = false;
-
-        for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            emit_log(&app_out, &line, false);
-            full.push_str(&line);
-            full.push('\n');
-
-            if !quit_sent {
-                let lower = line.to_ascii_lowercase();
-                if line.contains("(*)") || lower.contains("input no to switch") {
-                    if let Ok(mut guard) = stdin_writer.lock() {
-                        let _ = guard.write_all(b"q\n");
-                        let _ = guard.flush();
-                    }
-                    quit_sent = true;
-                }
-            }
-        }
-
-        if !quit_sent {
-            if let Ok(mut guard) = stdin_writer.lock() {
-                let _ = guard.write_all(b"q\n");
-                let _ = guard.flush();
-            }
-        }
-
-        Ok(full)
-    });
-
-    let stderr_handle = stderr.map(|stderr| {
-        let app_err = app.clone();
-        thread::spawn(move || read_tool_stream(stderr, app_err, false))
-    });
-
-    let _ = wait_for_child(&mut child, Duration::from_secs(10))?;
-
-    let mut output = stdout_handle
-        .join()
-        .map_err(|_| "stdout reader thread panicked".to_string())??;
-    if let Some(handle) = stderr_handle {
-        output.push_str(&handle.join().map_err(|_| "stderr reader thread panicked".to_string())??);
-    }
-
-    parse_current_storage(&output)
-        .ok_or_else(|| "Get current storage failed: no active storage marker (*) found".to_string())
+    })
 }
 
 fn run_tool_sync(
@@ -1028,134 +824,11 @@ fn run_tool_sync(
     }
 }
 
-fn parse_field(line: &str, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        for prefix in [*key, &key.to_ascii_lowercase()] {
-            let marker = format!("{prefix}=");
-            if let Some(idx) = line.find(&marker) {
-                let rest = &line[idx + marker.len()..];
-                let value: String = rest
-                    .chars()
-                    .take_while(|c| !c.is_whitespace() && *c != ',')
-                    .collect();
-                if !value.is_empty() {
-                    return Some(value);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn run_ld_sync(tool_path: &Path, work_dir: &Path) -> Result<String, String> {
-    let mut cmd = Command::new(tool_path);
-    cmd.current_dir(work_dir).arg("LD");
-    #[cfg(windows)]
-    apply_windows_hidden(&mut cmd);
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to start upgrade_tool: {e}"))?;
-
-    let mut combined = String::new();
-    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
-    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
-
-    if !stderr.is_empty() {
-        combined.push_str(&stderr);
-        if !stderr.ends_with('\n') {
-            combined.push('\n');
-        }
-    }
-    combined.push_str(&stdout);
-    Ok(combined)
-}
-
-fn parse_devices_from_blob(output: &str) -> Vec<RockusbDevice> {
-    let text = strip_ansi(output);
-    let lower = text.to_ascii_lowercase();
-    let mut devices: Vec<RockusbDevice> = Vec::new();
-    let mut start = 0;
-
-    while let Some(rel) = lower[start..].find("locationid=") {
-        let idx = start + rel;
-        let slice = &text[idx..];
-        if let Some(id) = parse_field(slice, &["LocationID", "LocationId"]) {
-            let mode = parse_field(slice, &["Mode"]).unwrap_or_else(|| "UNKNOWN".to_string());
-            if !devices.iter().any(|d| d.location_id == id) {
-                devices.push(RockusbDevice {
-                    label: format!("{id} : {}", mode.to_ascii_uppercase()),
-                    location_id: id,
-                    mode,
-                });
-            }
-        }
-        start = idx + 1;
-    }
-
-    devices
-}
-
-fn parse_devices_by_lines(output: &str) -> Vec<RockusbDevice> {
-    let mut devices = Vec::new();
-    for line in output.lines() {
-        let line = strip_ansi(line);
-        if line.is_empty() {
-            continue;
-        }
-
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("no found") || lower.contains("not found") {
-            continue;
-        }
-
-        if !lower.contains("locationid=") && !lower.contains("devno=") {
-            if !(line.contains(':') && (lower.contains("maskrom") || lower.contains("loader"))) {
-                continue;
-            }
-        }
-
-        if let Some(id) = parse_field(&line, &["LocationID", "LocationId"]) {
-            let mode_str = parse_field(&line, &["Mode"]).unwrap_or_else(|| "UNKNOWN".to_string());
-            devices.push(RockusbDevice {
-                label: format!("{id} : {}", mode_str.to_ascii_uppercase()),
-                location_id: id,
-                mode: mode_str,
-            });
-            continue;
-        }
-
-        if line.contains(':') && (lower.contains("maskrom") || lower.contains("loader")) {
-            let parts: Vec<&str> = line.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                let id = parts[0].trim();
-                let mode_part = parts[1].trim();
-                if !id.is_empty() {
-                    devices.push(RockusbDevice {
-                        label: format!("{id} : {mode_part}"),
-                        location_id: id.to_string(),
-                        mode: mode_part.to_string(),
-                    });
-                }
-            }
-        }
-    }
-    devices
-}
-
-fn parse_devices(output: &str) -> Vec<RockusbDevice> {
-    let devices = parse_devices_by_lines(output);
-    if !devices.is_empty() {
-        return devices;
-    }
-    parse_devices_from_blob(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        command_matches_success, is_progress_line, parse_devices, timeout_for_bytes,
-        write_payload_bytes, TerminalLineBuffer,
+        command_matches_success, is_progress_line, timeout_for_bytes, write_payload_bytes,
+        TerminalLineBuffer,
     };
     use std::fs;
     use std::time::Duration;
@@ -1310,43 +983,6 @@ mod tests {
         assert!(output.contains("Download Boot Success"));
         assert!(command_matches_success(&args, &output, true));
     }
-
-    #[test]
-    fn parse_ld_comma_separated_line() {
-        let output = "List of rockusb connected(1)\n\
-            DevNo=1 Vid=0x2207,Pid=0x110c,LocationID=24113  Mode=Maskrom    SerialNo=\n";
-        let devices = parse_devices(output);
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].location_id, "24113");
-        assert_eq!(devices[0].mode, "Maskrom");
-    }
-
-    #[test]
-    fn parse_ld_serial_no_suffix() {
-        let output = "Using /path/config.ini\nList of rockusb connected(1)\n\
-            DevNo=1 Vid=0x2207,Pid=0x110c,LocationID=24113 Mode=Maskrom SerialNo=rockchip\n";
-        let devices = parse_devices(output);
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].location_id, "24113");
-        assert_eq!(devices[0].mode, "Maskrom");
-    }
-
-    #[test]
-    fn parse_ld_no_devices() {
-        let output = "List of rockusb connected(0)\n";
-        assert!(parse_devices(output).is_empty());
-    }
-
-    #[test]
-    fn parse_current_storage_from_ssd_output() {
-        let output = "List of supported storage\n\
-            No=1    FLASH\n\
-            No=6    SPINAND(*)\n\
-            Input No to switch,Quit press <Q>:\n";
-        let info = super::parse_current_storage(output).unwrap();
-        assert_eq!(info.no, 6);
-        assert_eq!(info.name, "SPINAND");
-    }
 }
 
 fn ensure_not_busy(state: &State<'_, AppState>) -> Result<(), String> {
@@ -1405,31 +1041,10 @@ pub async fn get_tool_info(app: AppHandle) -> Result<ToolInfo, String> {
 #[tauri::command]
 pub async fn list_devices(app: AppHandle, state: State<'_, AppState>) -> Result<Vec<RockusbDevice>, String> {
     if *state.busy.lock().map_err(|e| e.to_string())? {
-        return cached_devices(&state);
+        return crate::devices::cached_devices(state.inner());
     }
 
-    let (tool_path, work_dir) = resolve_tool_paths(&app)?;
-    let output = tauri::async_runtime::spawn_blocking(move || run_ld_sync(&tool_path, &work_dir))
-        .await
-        .map_err(|e| e.to_string())??;
-
-    let devices = parse_devices(&output);
-    store_devices(&state, &devices)?;
-
-    {
-        let mut selected = state.selected_device.lock().map_err(|e| e.to_string())?;
-        if devices.is_empty() {
-            *selected = None;
-        } else if !devices
-            .iter()
-            .any(|d| selected.as_deref() == Some(d.location_id.as_str()))
-        {
-            *selected = Some(devices[0].location_id.clone());
-        }
-    }
-
-    let _ = app.emit(EVENT_DEVICES, &devices);
-    Ok(devices)
+    crate::devices::resync_devices(&app, state.inner()).await
 }
 
 #[tauri::command]
@@ -1490,42 +1105,6 @@ pub async fn upgrade_firmware(
         return Err(format!("Firmware upgrade failed: {detail}{hint}"));
     }
     Ok(())
-}
-
-#[tauri::command]
-pub async fn download_boot(app: AppHandle, state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let args = vec![String::from("DB"), path];
-    let result = with_tool(app, state, move |app, tool, dir, device| {
-        run_tool_sync(app, tool, dir, device, &args, false)
-    })
-    .await?;
-
-    if !result.success {
-        let detail = if output_has_error(&result.output) {
-            tool_error_summary(&result.output)
-        } else {
-            "upgrade_tool exited with non-zero status".to_string()
-        };
-        let hint = if !linux_usb_permission_hint(&result.output).is_empty() {
-            linux_usb_permission_hint(&result.output)
-        } else if detail.to_ascii_lowercase().contains("ddr") || detail.contains("请检查") {
-            " (Check DDR/chip and USB connection, re-enter Maskrom and retry)"
-        } else {
-            " (Use a Loader file such as MiniLoaderAll.bin; verify download.bin is a valid Loader)"
-        };
-        return Err(format!("Boot download failed: {detail}.{hint}"));
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn read_chip_info(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    let result = with_tool(app, state, |app, tool, dir, device| {
-        run_tool_sync(app, tool, dir, device, &[String::from("RCI")], false)
-    })
-    .await?;
-
-    Ok(result.output)
 }
 
 #[tauri::command]
@@ -1676,32 +1255,6 @@ fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, St
 }
 
 #[tauri::command]
-pub async fn get_current_storage(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<CurrentStorageInfo, String> {
-    ensure_not_busy(&state)?;
-    set_busy(&state, true)?;
-
-    let device = state
-        .selected_device
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone();
-    let device_arg = device_arg_for_tool(&state, device);
-
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let (tool_path, work_dir) = resolve_tool_paths(&app)?;
-        run_ssd_query_sync(&app, &tool_path, &work_dir, device_arg.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let _ = set_busy(&state, false);
-    result
-}
-
-#[tauri::command]
 pub async fn run_action(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1714,6 +1267,17 @@ pub async fn run_action(
         sector_count: None,
         output_path: None,
     });
+
+    if let Some(output) = crate::device_ops::try_run_action(
+        app.clone(),
+        state.clone(),
+        &action,
+        params.start_sector.as_deref(),
+    )
+    .await?
+    {
+        return Ok(output);
+    }
 
     let args = action_to_args(&action, &params)?;
     let result = with_tool(app, state, move |app, tool, dir, device| {
