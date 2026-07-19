@@ -25,6 +25,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app", "dmg", "appimage", "deb", "nsis"],
     "resources": [
       "bin/mac/*",
@@ -48,6 +49,17 @@
         },
         "postInstallScript": "../packaging/linux/deb-postinstall.sh",
         "postRemoveScript": "../packaging/linux/deb-postremove.sh"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVGMDNERDFFRkNCODZEMEQKUldRTmJiajhIdDBENzQwQ25yN2FxcVp0bzJqMjBWbU96OURWaHdSRm9GWTlpU2lxdW9pYXBPTlgK",
+      "endpoints": [
+        "https://github.com/hiifong/rkdevtool/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

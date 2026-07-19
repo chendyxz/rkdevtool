@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type { PageId } from "../../types/app";
 import type { Locale } from "../../types/locale";
 import { GITHUB_REPO_URL } from "../../constants/app";
+import { useAppUpdater } from "../../composables/useAppUpdater";
 import { useI18n } from "../../i18n";
 import packageJson from "../../../package.json";
 
@@ -15,6 +16,7 @@ defineProps<{
 const emit = defineEmits<{ navigate: [page: PageId] }>();
 
 const { locale, setLocale, t } = useI18n();
+const { checking, updating, progressText, checkForUpdates } = useAppUpdater();
 const appVersion = ref(`v${packageJson.version}`);
 
 const navItems = computed(() => [
@@ -22,6 +24,12 @@ const navItems = computed(() => [
   { id: "upgrade" as const, label: t("nav.upgrade") },
   { id: "advanced" as const, label: t("nav.advanced") },
 ]);
+
+const updateButtonLabel = computed(() => {
+  if (updating.value && progressText.value) return progressText.value;
+  if (checking.value || updating.value) return t("update.checking");
+  return t("update.check");
+});
 
 function switchLocale(next: Locale) {
   setLocale(next);
@@ -87,6 +95,14 @@ onMounted(async () => {
         </button>
       </div>
       <div class="sidebar__version">{{ appVersion }}</div>
+      <button
+        type="button"
+        class="sidebar__update"
+        :disabled="checking || updating"
+        @click="checkForUpdates"
+      >
+        {{ updateButtonLabel }}
+      </button>
       <a
         class="sidebar__github"
         :href="GITHUB_REPO_URL"
@@ -225,6 +241,29 @@ onMounted(async () => {
   font-size: 12px;
   line-height: 1;
   color: var(--color-text-muted);
+}
+
+.sidebar__update {
+  width: 100%;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.sidebar__update:hover:not(:disabled) {
+  background: var(--color-sidebar-hover);
+  color: #e2e8f0;
+}
+
+.sidebar__update:disabled {
+  opacity: 0.7;
+  cursor: default;
 }
 
 .sidebar__github {
