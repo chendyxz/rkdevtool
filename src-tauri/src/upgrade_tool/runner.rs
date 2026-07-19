@@ -1273,6 +1273,7 @@ pub async fn run_action(
         state.clone(),
         &action,
         params.start_sector.as_deref(),
+        params.sector_count.as_deref(),
     )
     .await?
     {

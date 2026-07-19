@@ -52,9 +52,6 @@ function actionParams(command: string) {
       sector_count: sectorCount.value || "1",
     };
   }
-  if (command === "擦除所有") {
-    return { boot_path: bootPath.value };
-  }
   return undefined;
 }
 

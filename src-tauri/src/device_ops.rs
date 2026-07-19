@@ -1,4 +1,4 @@
-//! Device operations via rockusb (chip/flash/storage/capability/boot/reset).
+//! Device operations via rockusb (chip/flash/storage/capability/boot/reset/erase).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -19,6 +19,12 @@ use crate::state::AppState;
 use crate::upgrade_tool::{CurrentStorageInfo, LogPayload};
 
 const EVENT_TOOL_LOG: &str = "tool-log";
+
+/// Match rkdeveloptool `EraseEmmc` / `erase_partition` chunk size (`1024 * 32` sectors).
+const ERASE_LBA_CHUNK: u32 = 1024 * 32;
+
+/// Match rkdeveloptool `MAX_ERASE_BLOCKS` for `RKU_EraseBlock`.
+const ERASE_BLOCK_CHUNK: u16 = 16;
 
 fn emit_log(app: &AppHandle, text: &str) {
     if text.is_empty() {
@@ -460,12 +466,182 @@ pub async fn reset_device(
     .await
 }
 
+/// Plan EraseLBA chunks: `(offset, count)` pairs matching rkdeveloptool / upgrade_tool `EL`.
+fn erase_lba_chunks(start: u32, count: u32) -> Result<Vec<(u32, u16)>, String> {
+    if count == 0 {
+        return Err("Sector count must be greater than 0".to_string());
+    }
+    let _end = start
+        .checked_add(count)
+        .ok_or_else(|| "Start sector + count overflows u32".to_string())?;
+
+    let mut chunks = Vec::new();
+    let mut offset = start;
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(ERASE_LBA_CHUNK) as u16;
+        chunks.push((offset, chunk));
+        offset += u32::from(chunk);
+        remaining -= u32::from(chunk);
+    }
+    Ok(chunks)
+}
+
+/// Erase LBA sectors (upgrade_tool `EL` / rkdeveloptool `RKU_EraseLBA`).
+pub async fn erase_sectors(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    start: u32,
+    count: u32,
+) -> Result<String, String> {
+    let chunks = erase_lba_chunks(start, count)?;
+    let chunk_total = chunks.len();
+
+    with_busy_device(
+        &app,
+        &state,
+        &format!("erase-lba start={start} count={count}"),
+        move |mut device| async move {
+            for (offset, chunk) in chunks {
+                device.erase_lba(offset, chunk).await.map_err(|e| {
+                    format!("Erase LBA failed at sector {offset} (count {chunk}): {e}")
+                })?;
+            }
+            let output = format!(
+                "Erase sectors OK: start={start}, count={count}, chunks={chunk_total}"
+            );
+            Ok((output.clone(), output))
+        },
+    )
+    .await
+}
+
+fn is_emmc_flash_id(id: &FlashId) -> bool {
+    id.to_str().as_bytes().get(..4) == Some(b"EMMC")
+}
+
+/// Plan `RKU_EraseBlock` chunks: `(block_offset, block_count)`.
+fn erase_block_chunks(block_count: u32) -> Result<Vec<(u32, u16)>, String> {
+    if block_count == 0 {
+        return Err("Flash block count is 0".to_string());
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0u32;
+    let mut remaining = block_count;
+    while remaining > 0 {
+        let chunk = remaining.min(u32::from(ERASE_BLOCK_CHUNK)) as u16;
+        chunks.push((offset, chunk));
+        offset += u32::from(chunk);
+        remaining -= u32::from(chunk);
+    }
+    Ok(chunks)
+}
+
+fn flash_block_count(info: &FlashInfo) -> Result<u32, String> {
+    let block_size = u32::from(info.block_size_sectors());
+    if block_size == 0 {
+        return Err("Flash reports block size 0".to_string());
+    }
+    let sectors = info.sectors();
+    if sectors == 0 {
+        return Err("Flash reports 0 sectors".to_string());
+    }
+    Ok(sectors / block_size)
+}
+
+/// Erase entire flash (upgrade_tool `EF` / rkdeveloptool `ef` / `EraseAllBlocks`).
+///
+/// Expects Loader mode (user downloads Boot separately). Direct LBA / eMMC uses
+/// `EraseLBA` from sector 0; otherwise `EraseForce` by flash blocks (CS0).
+pub async fn erase_all(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let app_for_progress = app.clone();
+    with_busy_device(&app, &state, "erase-flash", move |mut device| async move {
+        let info = device
+            .flash_info()
+            .await
+            .map_err(|e| {
+                format!(
+                    "Read Flash info failed: {e} (in Maskrom, download Boot/Loader first, then retry)"
+                )
+            })?;
+        let sectors = info.sectors();
+        if sectors == 0 {
+            return Err("Flash reports 0 sectors".to_string());
+        }
+
+        let direct_lba = device
+            .capability()
+            .await
+            .map(|cap| cap.direct_lba())
+            .unwrap_or(false);
+        let is_emmc = device
+            .flash_id()
+            .await
+            .map(|id| is_emmc_flash_id(&id))
+            .unwrap_or(false);
+
+        let mut log = format!(
+            "Flash: {} sectors ({} MB), block={} sectors, direct_lba={}, emmc={}\n",
+            sectors,
+            sectors / 2048,
+            info.block_size_sectors(),
+            direct_lba,
+            is_emmc
+        );
+
+        if direct_lba || is_emmc {
+            let chunks = erase_lba_chunks(0, sectors)?;
+            let total = chunks.len();
+            log.push_str(&format!("Erase path: LBA ({total} chunks)\n"));
+            for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
+                device.erase_lba(offset, chunk).await.map_err(|e| {
+                    format!("Erase LBA failed at sector {offset} (count {chunk}): {e}")
+                })?;
+                if (i + 1) % 8 == 0 || i + 1 == total {
+                    let done = offset.saturating_add(u32::from(chunk)).min(sectors);
+                    emit_log(
+                        &app_for_progress,
+                        &format!("Erase progress: {done}/{sectors} sectors"),
+                    );
+                }
+            }
+        } else {
+            let block_count = flash_block_count(&info)?;
+            let chunks = erase_block_chunks(block_count)?;
+            let total = chunks.len();
+            log.push_str(&format!(
+                "Erase path: Force block erase, {block_count} blocks ({total} chunks)\n"
+            ));
+            for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
+                device.erase_force(offset, chunk).await.map_err(|e| {
+                    format!("Erase block failed at block {offset} (count {chunk}): {e}")
+                })?;
+                if (i + 1) % 8 == 0 || i + 1 == total {
+                    let done = offset.saturating_add(u32::from(chunk)).min(block_count);
+                    emit_log(
+                        &app_for_progress,
+                        &format!("Erase progress: {done}/{block_count} blocks"),
+                    );
+                }
+            }
+        }
+
+        log.push_str("Erase Flash OK");
+        Ok((log.clone(), log))
+    })
+    .await
+}
+
 /// Handle rockusb-backed advanced actions. Returns `None` if action stays on upgrade_tool.
 pub async fn try_run_action(
     app: AppHandle,
     state: State<'_, AppState>,
     action: &str,
     start_sector: Option<&str>,
+    sector_count: Option<&str>,
 ) -> Result<Option<String>, String> {
     match action {
         "读取FlashID" => Ok(Some(read_flash_id(app, state).await?)),
@@ -483,6 +659,20 @@ pub async fn try_run_action(
                 .map_err(|_| "Invalid storage index".to_string())?;
             Ok(Some(switch_storage(app, state, no).await?))
         }
+        "擦除扇区" => {
+            let start: u32 = start_sector
+                .filter(|s| !s.is_empty())
+                .unwrap_or("0")
+                .parse()
+                .map_err(|_| "Invalid start sector".to_string())?;
+            let count: u32 = sector_count
+                .filter(|s| !s.is_empty())
+                .unwrap_or("1")
+                .parse()
+                .map_err(|_| "Invalid sector count".to_string())?;
+            Ok(Some(erase_sectors(app, state, start, count).await?))
+        }
+        "擦除所有" => Ok(Some(erase_all(app, state).await?)),
         _ => Ok(None),
     }
 }
@@ -517,5 +707,40 @@ mod tests {
         assert_eq!(storage_from_ui_no(10).unwrap(), StorageIndex::Pcie);
         assert_eq!(storage_to_ui(StorageIndex::Sata).name, "SATA");
         assert_eq!(storage_to_ui(StorageIndex::SpiNand).no, 6);
+    }
+
+    #[test]
+    fn erase_lba_chunks_single_and_split() {
+        assert_eq!(erase_lba_chunks(0, 1).unwrap(), vec![(0, 1)]);
+        assert_eq!(
+            erase_lba_chunks(100, ERASE_LBA_CHUNK).unwrap(),
+            vec![(100, ERASE_LBA_CHUNK as u16)]
+        );
+        assert_eq!(
+            erase_lba_chunks(0, ERASE_LBA_CHUNK + 10).unwrap(),
+            vec![(0, ERASE_LBA_CHUNK as u16), (ERASE_LBA_CHUNK, 10)]
+        );
+        assert!(erase_lba_chunks(0, 0).is_err());
+        assert!(erase_lba_chunks(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn erase_block_chunks_respect_max() {
+        assert_eq!(erase_block_chunks(1).unwrap(), vec![(0, 1)]);
+        assert_eq!(
+            erase_block_chunks(20).unwrap(),
+            vec![(0, 16), (16, 4)]
+        );
+        assert!(erase_block_chunks(0).is_err());
+    }
+
+    #[test]
+    fn flash_block_count_from_sectors() {
+        // 256 MiB / 128 KiB blocks → 2048 blocks
+        let mut raw = [0u8; 11];
+        raw[0..4].copy_from_slice(&524288u32.to_le_bytes()); // sectors
+        raw[4..6].copy_from_slice(&256u16.to_le_bytes()); // block size in sectors (128KiB)
+        let info = FlashInfo::from_bytes(raw);
+        assert_eq!(flash_block_count(&info).unwrap(), 2048);
     }
 }
