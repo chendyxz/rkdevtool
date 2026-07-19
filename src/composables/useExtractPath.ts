@@ -29,3 +29,7 @@ export async function buildExtractOutputDir(
 export async function buildSerialLogPath(parentDir: string): Promise<string> {
   return join(parentDir, buildSerialLogFileName());
 }
+
+export function buildExportImageFileName(date = new Date()): string {
+  return `rkdevtool_dump_${formatExtractTimestamp(date)}.img`;
+}

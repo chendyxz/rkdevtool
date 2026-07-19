@@ -1124,25 +1124,53 @@ pub async fn download_execute(
     }
 
     let force = payload.force_by_address;
-    let result = with_tool(app, state, move |app, tool, dir, device| {
-        if force {
-            for row in &rows {
-                let addr = row.address.trim();
-                if addr.is_empty() {
-                    return Err(format!("Address is required for force-by-address write: {}", row.name));
+    if force {
+        let mut last_switched: Option<u32> = None;
+        for row in &rows {
+            let addr = row.address.trim();
+            if addr.is_empty() {
+                return Err(format!(
+                    "Address is required for force-by-address write: {}",
+                    row.name
+                ));
+            }
+            if !row.storage.trim().is_empty() {
+                let no = crate::device_ops::storage_name_to_ui_no(&row.storage)?;
+                if last_switched != Some(no) {
+                    crate::device_ops::switch_storage(app.clone(), state.clone(), no).await?;
+                    last_switched = Some(no);
                 }
-                let args = vec![String::from("WL"), addr.to_string(), row.path.clone()];
+            } else {
+                emit_log(
+                    &app,
+                    "Tip: select a storage type (e.g. SPINAND) before force-by-address write",
+                    false,
+                );
+            }
+
+            let path = row.path.clone();
+            let name = row.name.clone();
+            let addr = addr.to_string();
+            let result = with_tool(app.clone(), state.clone(), move |app, tool, dir, device| {
+                let args = vec![String::from("WL"), addr, path];
                 let r = run_tool_sync(app, tool, dir, device, &args, false)?;
                 if !r.success {
-                    return Err(format!("Write failed: {}", row.name));
+                    return Err(format!("Write failed: {name}"));
                 }
+                Ok(CommandResult {
+                    success: true,
+                    output: String::new(),
+                })
+            })
+            .await?;
+            if !result.success {
+                return Err(format!("Write failed: {}", row.name));
             }
-            return Ok(CommandResult {
-                success: true,
-                output: String::new(),
-            });
         }
+        return Ok(());
+    }
 
+    let result = with_tool(app, state, move |app, tool, dir, device| {
         for row in &rows {
             if row.name.eq_ignore_ascii_case("loader") {
                 let mut args = vec![String::from("UL"), row.path.clone()];
@@ -1274,6 +1302,7 @@ pub async fn run_action(
         &action,
         params.start_sector.as_deref(),
         params.sector_count.as_deref(),
+        params.output_path.as_deref(),
     )
     .await?
     {

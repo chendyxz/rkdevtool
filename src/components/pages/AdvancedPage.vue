@@ -1,12 +1,16 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { message, open } from "@tauri-apps/plugin-dialog";
+import { message, open, save } from "@tauri-apps/plugin-dialog";
 import AppButton from "../ui/AppButton.vue";
 import PathField from "../ui/PathField.vue";
 import { useAppState } from "../../composables/useAppState";
 import { useToolCommand, toolApi } from "../../composables/useToolCommand";
 import { pickFile } from "../../composables/useFilePicker";
-import { buildExtractOutputDir, buildSerialLogPath } from "../../composables/useExtractPath";
+import {
+  buildExportImageFileName,
+  buildExtractOutputDir,
+  buildSerialLogPath,
+} from "../../composables/useExtractPath";
 import { ADVANCED_ACTIONS } from "../../constants/advancedActions";
 import { useI18n } from "../../i18n";
 import { logText } from "../../i18n/logText";
@@ -76,6 +80,30 @@ async function exportSerialLog(labelKey: string) {
   }
 }
 
+async function exportImage(labelKey: string) {
+  const outputPath = await save({
+    title: t("advanced.pickExportImage"),
+    defaultPath: buildExportImageFileName(),
+    filters: [{ name: "Image", extensions: ["img", "bin"] }],
+  });
+  if (!outputPath) return;
+
+  try {
+    await run(
+      () =>
+        toolApi.runAction("导出镜像", {
+          start_sector: startSector.value || "0",
+          sector_count: sectorCount.value.trim() || undefined,
+          output_path: outputPath,
+        }),
+      logText(labelKey),
+    );
+    appendLog(t("advanced.exportImageSuccess", { path: outputPath }), "success");
+  } catch (err) {
+    appendLog(String(err), "error");
+  }
+}
+
 async function getCurrentStorageAction(labelKey: string) {
   try {
     const result = await run(() => toolApi.getCurrentStorage(), logText(labelKey));
@@ -102,7 +130,7 @@ async function getCurrentStorageAction(labelKey: string) {
 
 async function runAction(command: string, labelKey: string) {
   if (command === "导出镜像") {
-    appendLog(logText("advanced.exportImageTodo"), "error");
+    await exportImage(labelKey);
     return;
   }
 

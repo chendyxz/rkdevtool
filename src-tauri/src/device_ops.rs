@@ -1,7 +1,7 @@
 //! Device operations via rockusb (chip/flash/storage/capability/boot/reset/erase).
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -25,6 +25,9 @@ const ERASE_LBA_CHUNK: u32 = 1024 * 32;
 
 /// Match rkdeveloptool `MAX_ERASE_BLOCKS` for `RKU_EraseBlock`.
 const ERASE_BLOCK_CHUNK: u16 = 16;
+
+/// Match rkdeveloptool `DEFAULT_RW_LBA` / rockusb `MAXIO_SIZE` (128 sectors).
+const READ_LBA_CHUNK: u32 = 128;
 
 fn emit_log(app: &AppHandle, text: &str) {
     if text.is_empty() {
@@ -51,6 +54,24 @@ fn emit_log(app: &AppHandle, text: &str) {
 fn emit_lines(app: &AppHandle, text: &str) {
     for line in text.lines() {
         emit_log(app, line);
+    }
+}
+
+/// Download / Advanced page storage name → 1-based UI SSD No.
+pub fn storage_name_to_ui_no(name: &str) -> Result<u32, String> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "FLASH" | "NAND" => Ok(1),
+        "EMMC" => Ok(2),
+        "SD" | "SD0" => Ok(3),
+        "SD1" => Ok(4),
+        "SPINOR" => Ok(5),
+        "SPINAND" => Ok(6),
+        "RAM" => Ok(7),
+        "USB" => Ok(8),
+        "SATA" => Ok(9),
+        "PCIE" => Ok(10),
+        other if other.is_empty() => Err("Storage type is empty".to_string()),
+        other => Err(format!("Unknown storage type: {other}")),
     }
 }
 
@@ -466,10 +487,13 @@ pub async fn reset_device(
     .await
 }
 
-/// Plan EraseLBA chunks: `(offset, count)` pairs matching rkdeveloptool / upgrade_tool `EL`.
-fn erase_lba_chunks(start: u32, count: u32) -> Result<Vec<(u32, u16)>, String> {
+/// Plan LBA operation chunks: `(offset, count)` pairs.
+fn lba_chunks(start: u32, count: u32, chunk_size: u32) -> Result<Vec<(u32, u16)>, String> {
     if count == 0 {
         return Err("Sector count must be greater than 0".to_string());
+    }
+    if chunk_size == 0 || chunk_size > u32::from(u16::MAX) {
+        return Err("Invalid LBA chunk size".to_string());
     }
     let _end = start
         .checked_add(count)
@@ -479,12 +503,20 @@ fn erase_lba_chunks(start: u32, count: u32) -> Result<Vec<(u32, u16)>, String> {
     let mut offset = start;
     let mut remaining = count;
     while remaining > 0 {
-        let chunk = remaining.min(ERASE_LBA_CHUNK) as u16;
+        let chunk = remaining.min(chunk_size) as u16;
         chunks.push((offset, chunk));
         offset += u32::from(chunk);
         remaining -= u32::from(chunk);
     }
     Ok(chunks)
+}
+
+fn erase_lba_chunks(start: u32, count: u32) -> Result<Vec<(u32, u16)>, String> {
+    lba_chunks(start, count, ERASE_LBA_CHUNK)
+}
+
+fn read_lba_chunks(start: u32, count: u32) -> Result<Vec<(u32, u16)>, String> {
+    lba_chunks(start, count, READ_LBA_CHUNK)
 }
 
 /// Erase LBA sectors (upgrade_tool `EL` / rkdeveloptool `RKU_EraseLBA`).
@@ -635,6 +667,107 @@ pub async fn erase_all(
     .await
 }
 
+/// Export flash image via ReadLBA (rkdeveloptool `rl`).
+///
+/// `count == None` means read from `start` to end of flash.
+pub async fn export_image(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    start: u32,
+    count: Option<u32>,
+    output_path: String,
+) -> Result<String, String> {
+    if output_path.trim().is_empty() {
+        return Err("Output path is required".to_string());
+    }
+    let out = Path::new(&output_path).to_path_buf();
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(format!("Output directory does not exist: {}", parent.display()));
+        }
+    }
+
+    let app_for_progress = app.clone();
+    with_busy_device(
+        &app,
+        &state,
+        &format!("read-lba start={start} -> {}", out.display()),
+        move |mut device| async move {
+            let total_sectors = device
+                .flash_info()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Read Flash info failed: {e} (in Maskrom, download Boot/Loader first, then retry)"
+                    )
+                })?
+                .sectors();
+            if total_sectors == 0 {
+                return Err("Flash reports 0 sectors".to_string());
+            }
+            if start >= total_sectors {
+                return Err(format!(
+                    "Start sector {start} is beyond flash size ({total_sectors} sectors)"
+                ));
+            }
+
+            let count = match count {
+                Some(c) if c > 0 => c,
+                Some(_) => return Err("Sector count must be greater than 0".to_string()),
+                None => total_sectors - start,
+            };
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| "Start sector + count overflows u32".to_string())?;
+            if end > total_sectors {
+                return Err(format!(
+                    "Read range [{start}, {end}) exceeds flash size ({total_sectors} sectors)"
+                ));
+            }
+
+            let chunks = read_lba_chunks(start, count)?;
+            let chunk_total = chunks.len();
+            let mut file = File::create(&out)
+                .map_err(|e| format!("Create output file failed: {e}"))?;
+            let mut buf = vec![0u8; READ_LBA_CHUNK as usize * 512];
+
+            for (i, (offset, chunk)) in chunks.into_iter().enumerate() {
+                let nbytes = chunk as usize * 512;
+                let slice = &mut buf[..nbytes];
+                let transferred = device.read_lba(offset, slice).await.map_err(|e| {
+                    format!("Read LBA failed at sector {offset} (count {chunk}): {e}")
+                })?;
+                if transferred as usize != nbytes {
+                    return Err(format!(
+                        "Short read at sector {offset}: got {transferred} bytes, expected {nbytes}"
+                    ));
+                }
+                file.write_all(slice)
+                    .map_err(|e| format!("Write output file failed: {e}"))?;
+
+                if (i + 1) % 32 == 0 || i + 1 == chunk_total {
+                    let done = offset.saturating_add(u32::from(chunk)).saturating_sub(start);
+                    let pct = ((u64::from(done) * 100) / u64::from(count)).min(100);
+                    emit_log(
+                        &app_for_progress,
+                        &format!("Export progress: {done}/{count} sectors ({pct}%)"),
+                    );
+                }
+            }
+            file.flush()
+                .map_err(|e| format!("Flush output file failed: {e}"))?;
+
+            let bytes = u64::from(count) * 512;
+            let output = format!(
+                "Export image OK: start={start}, count={count}, bytes={bytes}, file={}",
+                out.display()
+            );
+            Ok((output.clone(), output))
+        },
+    )
+    .await
+}
+
 /// Handle rockusb-backed advanced actions. Returns `None` if action stays on upgrade_tool.
 pub async fn try_run_action(
     app: AppHandle,
@@ -642,6 +775,7 @@ pub async fn try_run_action(
     action: &str,
     start_sector: Option<&str>,
     sector_count: Option<&str>,
+    output_path: Option<&str>,
 ) -> Result<Option<String>, String> {
     match action {
         "读取FlashID" => Ok(Some(read_flash_id(app, state).await?)),
@@ -673,6 +807,25 @@ pub async fn try_run_action(
             Ok(Some(erase_sectors(app, state, start, count).await?))
         }
         "擦除所有" => Ok(Some(erase_all(app, state).await?)),
+        "导出镜像" => {
+            let start: u32 = start_sector
+                .filter(|s| !s.is_empty())
+                .unwrap_or("0")
+                .parse()
+                .map_err(|_| "Invalid start sector".to_string())?;
+            let count = match sector_count.filter(|s| !s.is_empty()) {
+                Some(s) => Some(
+                    s.parse::<u32>()
+                        .map_err(|_| "Invalid sector count".to_string())?,
+                ),
+                None => None,
+            };
+            let path = output_path
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "Output path is required".to_string())?
+                .to_string();
+            Ok(Some(export_image(app, state, start, count, path).await?))
+        }
         _ => Ok(None),
     }
 }
@@ -688,6 +841,16 @@ mod tests {
             let info = storage_to_ui(idx);
             assert_eq!(info.no, no, "no={no} idx={idx:?}");
         }
+    }
+
+    #[test]
+    fn storage_name_maps_spinand() {
+        assert_eq!(storage_name_to_ui_no("SPINAND").unwrap(), 6);
+        assert_eq!(storage_name_to_ui_no("spinand").unwrap(), 6);
+        assert_eq!(
+            storage_from_ui_no(storage_name_to_ui_no("SPINAND").unwrap()).unwrap(),
+            StorageIndex::MtdBlkSpiNand
+        );
     }
 
     #[test]
@@ -722,6 +885,15 @@ mod tests {
         );
         assert!(erase_lba_chunks(0, 0).is_err());
         assert!(erase_lba_chunks(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn read_lba_chunks_match_rkdeveloptool_default() {
+        assert_eq!(read_lba_chunks(0, 128).unwrap(), vec![(0, 128)]);
+        assert_eq!(
+            read_lba_chunks(10, 200).unwrap(),
+            vec![(10, 128), (138, 72)]
+        );
     }
 
     #[test]
