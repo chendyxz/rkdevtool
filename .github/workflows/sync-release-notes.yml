@@ -1,0 +1,55 @@
+name: sync release notes
+
+on:
+  release:
+    types: [edited]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-updater-notes:
+    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm this is the latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: |
+          latest_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .id)"
+          if [ "$latest_id" = "$RELEASE_ID" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the updater manifest
+        if: steps.release.outputs.is_latest == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p updater
+          gh release download "$RELEASE_TAG" --pattern latest.json --dir updater
+
+      - name: Copy Release Notes into the updater manifest
+        if: steps.release.outputs.is_latest == 'true'
+        env:
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = "updater/latest.json";
+            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+            manifest.notes = process.env.RELEASE_BODY || "";
+            fs.writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+          '
+
+      - name: Replace the updater manifest
+        if: steps.release.outputs.is_latest == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" updater/latest.json --clobber

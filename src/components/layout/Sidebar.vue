@@ -50,6 +50,8 @@ onMounted(async () => {
   } catch {
     // 浏览器预览等非 Tauri 环境沿用 package.json 版本
   }
+
+  await checkForUpdates({ silent: true });
 });
 </script>
 
@@ -99,7 +101,7 @@ onMounted(async () => {
         type="button"
         class="sidebar__update"
         :disabled="checking || updating"
-        @click="checkForUpdates"
+        @click="checkForUpdates()"
       >
         {{ updateButtonLabel }}
       </button>

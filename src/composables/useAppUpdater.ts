@@ -10,7 +10,7 @@ export function useAppUpdater() {
   const updating = ref(false);
   const progressText = ref("");
 
-  async function checkForUpdates() {
+  async function checkForUpdates({ silent = false }: { silent?: boolean } = {}) {
     if (checking.value || updating.value) return;
 
     checking.value = true;
@@ -19,10 +19,12 @@ export function useAppUpdater() {
     try {
       const update = await check();
       if (!update) {
-        await message(t("update.upToDate"), {
-          title: t("update.title"),
-          kind: "info",
-        });
+        if (!silent) {
+          await message(t("update.upToDate"), {
+            title: t("update.title"),
+            kind: "info",
+          });
+        }
         return;
       }
 
@@ -70,11 +72,13 @@ export function useAppUpdater() {
 
       await relaunch();
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      await message(t("update.failed", { error: detail }), {
-        title: t("update.title"),
-        kind: "error",
-      });
+      if (!silent) {
+        const detail = error instanceof Error ? error.message : String(error);
+        await message(t("update.failed", { error: detail }), {
+          title: t("update.title"),
+          kind: "error",
+        });
+      }
     } finally {
       checking.value = false;
       updating.value = false;
