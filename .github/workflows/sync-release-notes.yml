@@ -12,6 +12,8 @@ jobs:
     if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+
       - name: Confirm this is the latest release
         id: release
         env:
