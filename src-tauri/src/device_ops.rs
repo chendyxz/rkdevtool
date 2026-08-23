@@ -17,11 +17,11 @@ use rockusb::protocol::{Capability, ChipInfo, FlashId, FlashInfo, ResetOpcode, S
 use crate::devices::{self, format_location_id_for, is_rockusb_device_info};
 use crate::firmware::{
     build_gpt_tables, extract_firmware_for_upgrade, parse_gpt_parameter,
-    parse_sparse_chunk_header, parse_sparse_header, FirmwareImage, GptTables, SparseChunkKind,
-    SparseHeader,
+    parse_parameter_partitions, parse_sparse_chunk_header, parse_sparse_header, FirmwareImage,
+    GptTables, SparseChunkKind, SparseHeader,
 };
 use crate::state::AppState;
-use crate::upgrade_tool::{CurrentStorageInfo, LogPayload};
+use crate::upgrade_tool::{CurrentStorageInfo, DownloadExecutePayload, LogPayload};
 
 const EVENT_TOOL_LOG: &str = "tool-log";
 
@@ -38,6 +38,15 @@ const SECTOR_SIZE: usize = 512;
 const WRITE_LBA_CHUNK: usize = READ_LBA_CHUNK as usize * SECTOR_SIZE;
 const LOADER_READY_RETRIES: usize = 20;
 const LOADER_READY_INTERVAL: Duration = Duration::from_millis(250);
+const PARAMETER_START_SECTOR: u32 = 0x20;
+const PARAMETER_READ_SECTORS: u32 = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadPartition {
+    name: String,
+    start_sector: u64,
+    sector_count: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LbaWriteChunk {
@@ -276,9 +285,7 @@ async fn open_selected_device(state: &AppState) -> Result<Device, String> {
         infos
             .into_iter()
             .find(|d| format_location_id_for(d) == location_id)
-            .ok_or_else(|| {
-                format!("Selected device {location_id} is no longer connected")
-            })?
+            .ok_or_else(|| format!("Selected device {location_id} is no longer connected"))?
     } else if infos.len() == 1 {
         infos.into_iter().next().unwrap()
     } else {
@@ -345,10 +352,7 @@ where
 }
 
 #[tauri::command]
-pub async fn read_chip_info(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn read_chip_info(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     with_busy_device(&app, &state, "chip-info", |mut device| async move {
         let info = device
             .chip_info()
@@ -413,10 +417,7 @@ pub async fn switch_storage(
     .await
 }
 
-pub async fn read_flash_id(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn read_flash_id(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     with_busy_device(&app, &state, "flash-id", |mut device| async move {
         let id = device
             .flash_id()
@@ -428,10 +429,7 @@ pub async fn read_flash_id(
     .await
 }
 
-pub async fn read_flash_info(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn read_flash_info(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     with_busy_device(&app, &state, "flash-info", |mut device| async move {
         let info = device
             .flash_info()
@@ -443,10 +441,7 @@ pub async fn read_flash_info(
     .await
 }
 
-pub async fn read_capability(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn read_capability(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     with_busy_device(&app, &state, "capability", |mut device| async move {
         let cap = device
             .capability()
@@ -515,7 +510,198 @@ async fn download_boot_to_device(device: &mut Device, boot_path: &Path) -> Resul
     Ok(log)
 }
 
-fn write_lba_chunk_plan(mut start_sector: u64, byte_count: u64) -> Result<Vec<LbaWriteChunk>, String> {
+fn parse_download_lba(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Address is required for force-by-address write".to_string());
+    }
+
+    let parsed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u64::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse());
+    parsed.map_err(|_| format!("Invalid LBA address: {value}"))
+}
+
+fn resolve_download_partition(
+    partitions: &[DownloadPartition],
+    name: &str,
+) -> Result<DownloadPartition, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Partition name is required unless force-by-address is enabled".to_string());
+    }
+
+    if name.eq_ignore_ascii_case("parameter") {
+        return Ok(DownloadPartition {
+            name: name.to_string(),
+            start_sector: u64::from(PARAMETER_START_SECTOR),
+            sector_count: None,
+        });
+    }
+
+    partitions
+        .iter()
+        .find(|partition| partition.name.eq_ignore_ascii_case(name))
+        .cloned()
+        .ok_or_else(|| format!("Partition {name} was not found on the selected storage"))
+}
+
+fn gpt_entry_layout(header: &[u8]) -> Result<Option<(u64, u32, u32)>, String> {
+    if header.len() < SECTOR_SIZE || &header[..8] != b"EFI PART" {
+        return Ok(None);
+    }
+
+    let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    if !(92..=SECTOR_SIZE).contains(&header_size) {
+        return Err("Invalid GPT header size".to_string());
+    }
+    let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let entry_count = u32::from_le_bytes(header[80..84].try_into().unwrap());
+    let entry_size = u32::from_le_bytes(header[84..88].try_into().unwrap());
+    if entry_count == 0 || entry_count > 4096 || !(128..=4096).contains(&entry_size) {
+        return Err("Unsupported GPT partition entry layout".to_string());
+    }
+    Ok(Some((entries_lba, entry_count, entry_size)))
+}
+
+fn parse_gpt_download_partitions(
+    header: &[u8],
+    entries: &[u8],
+) -> Result<Option<Vec<DownloadPartition>>, String> {
+    let Some((_, entry_count, entry_size)) = gpt_entry_layout(header)? else {
+        return Ok(None);
+    };
+    let total_bytes = usize::try_from(u64::from(entry_count) * u64::from(entry_size))
+        .map_err(|_| "GPT partition table is too large".to_string())?;
+    if entries.len() < total_bytes {
+        return Err("GPT partition table is incomplete".to_string());
+    }
+
+    let entry_size = entry_size as usize;
+    let mut partitions = Vec::new();
+    for entry in entries[..total_bytes].chunks_exact(entry_size) {
+        if entry[..16].iter().all(|byte| *byte == 0) {
+            continue;
+        }
+        let start_sector = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+        let end_sector = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+        if end_sector < start_sector {
+            return Err("GPT partition has an invalid sector range".to_string());
+        }
+
+        let mut name_words = Vec::new();
+        for bytes in entry[56..].chunks_exact(2) {
+            let word = u16::from_le_bytes(bytes.try_into().unwrap());
+            if word == 0 {
+                break;
+            }
+            name_words.push(word);
+        }
+        let name = String::from_utf16(&name_words)
+            .map_err(|_| "GPT partition name is not valid UTF-16".to_string())?;
+        if name.trim().is_empty() {
+            continue;
+        }
+        partitions.push(DownloadPartition {
+            name,
+            start_sector,
+            sector_count: Some(
+                end_sector
+                    .checked_sub(start_sector)
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(|| "GPT partition size overflows".to_string())?,
+            ),
+        });
+    }
+    Ok(Some(partitions))
+}
+
+async fn read_lba_sectors(
+    device: &mut Device,
+    start_sector: u32,
+    sector_count: u32,
+) -> Result<Vec<u8>, String> {
+    let byte_count = usize::try_from(u64::from(sector_count) * SECTOR_SIZE as u64)
+        .map_err(|_| "LBA read is too large".to_string())?;
+    let mut data = vec![0u8; byte_count];
+    let mut done = 0u32;
+    while done < sector_count {
+        let count = (sector_count - done).min(READ_LBA_CHUNK);
+        let offset = usize::try_from(u64::from(done) * SECTOR_SIZE as u64)
+            .map_err(|_| "LBA read offset overflows".to_string())?;
+        let len = count as usize * SECTOR_SIZE;
+        let sector = start_sector
+            .checked_add(done)
+            .ok_or_else(|| "LBA read address overflows".to_string())?;
+        let transferred = device
+            .read_lba(sector, &mut data[offset..offset + len])
+            .await
+            .map_err(|e| format!("Read LBA {sector} failed: {e}"))?;
+        if transferred as usize != len {
+            return Err(format!(
+                "Short LBA read at {sector}: got {transferred} bytes, expected {len}"
+            ));
+        }
+        done += count;
+    }
+    Ok(data)
+}
+
+async fn read_download_partitions(device: &mut Device) -> Result<Vec<DownloadPartition>, String> {
+    let header = read_lba_sectors(device, 1, 1).await?;
+    if let Some((entries_lba, entry_count, entry_size)) = gpt_entry_layout(&header)? {
+        let entry_bytes = u64::from(entry_count) * u64::from(entry_size);
+        let entry_sectors = entry_bytes.div_ceil(SECTOR_SIZE as u64);
+        let entry_start = u32::try_from(entries_lba)
+            .map_err(|_| "GPT partition table address exceeds RockUSB LBA range".to_string())?;
+        let entry_sectors = u32::try_from(entry_sectors)
+            .map_err(|_| "GPT partition table is too large".to_string())?;
+        let entries = read_lba_sectors(device, entry_start, entry_sectors).await?;
+        return parse_gpt_download_partitions(&header, &entries)?
+            .ok_or_else(|| "GPT partition table is missing".to_string());
+    }
+
+    let parameter =
+        read_lba_sectors(device, PARAMETER_START_SECTOR, PARAMETER_READ_SECTORS).await?;
+    let partitions = parse_parameter_partitions(&parameter)?
+        .ok_or_else(|| "No GPT or Rockchip parameter partition table found".to_string())?;
+    Ok(partitions
+        .into_iter()
+        .map(|partition| DownloadPartition {
+            name: partition.name,
+            start_sector: partition.start_sector,
+            sector_count: partition.sector_count,
+        })
+        .collect())
+}
+
+fn image_for_download(
+    name: &str,
+    path: &str,
+    partition: DownloadPartition,
+) -> Result<FirmwareImage, String> {
+    let path = PathBuf::from(path);
+    let byte_count = std::fs::metadata(&path)
+        .map_err(|e| format!("Read image metadata failed for {}: {e}", path.display()))?
+        .len();
+    if byte_count == 0 {
+        return Err(format!("Image {} is empty", path.display()));
+    }
+    Ok(FirmwareImage {
+        name: name.trim().to_string(),
+        path,
+        flash_offset_sectors: partition.start_sector,
+        flash_size_sectors: partition.sector_count.unwrap_or(0),
+        byte_count,
+    })
+}
+
+fn write_lba_chunk_plan(
+    mut start_sector: u64,
+    byte_count: u64,
+) -> Result<Vec<LbaWriteChunk>, String> {
     if byte_count == 0 {
         return Err("Firmware image is empty".to_string());
     }
@@ -565,7 +751,10 @@ async fn write_firmware_image(
     }
 
     let chunks = write_lba_chunk_plan(image.flash_offset_sectors, actual_size)?;
-    let total_transfer = chunks.iter().map(|chunk| chunk.transfer_len as u64).sum::<u64>();
+    let total_transfer = chunks
+        .iter()
+        .map(|chunk| chunk.transfer_len as u64)
+        .sum::<u64>();
     let total_sectors = total_transfer / SECTOR_SIZE as u64;
     if image.flash_size_sectors > 0 && total_sectors > image.flash_size_sectors {
         return Err(format!(
@@ -598,7 +787,8 @@ async fn write_firmware_image(
         ),
     );
 
-    let mut input = File::open(&image.path).map_err(|e| format!("Open extracted image failed: {e}"))?;
+    let mut input =
+        File::open(&image.path).map_err(|e| format!("Open extracted image failed: {e}"))?;
     let mut written = 0u64;
     let mut last_progress_percent = None;
     for chunk in &chunks {
@@ -609,7 +799,12 @@ async fn write_firmware_image(
         let transferred = device
             .write_lba(chunk.start_sector, &data)
             .await
-            .map_err(|e| format!("Write {} at LBA {} failed: {e}", image.name, chunk.start_sector))?;
+            .map_err(|e| {
+                format!(
+                    "Write {} at LBA {} failed: {e}",
+                    image.name, chunk.start_sector
+                )
+            })?;
         if transferred as usize != chunk.transfer_len {
             return Err(format!(
                 "Short write for {} at LBA {}: got {transferred} bytes, expected {}",
@@ -705,8 +900,14 @@ async fn write_sparse_firmware_image(
         if sparse_chunk_requires_write(chunk.kind) {
             match chunk.kind {
                 SparseChunkKind::Raw => {
-                    write_sparse_stream_chunk(device, &mut input, image, written, chunk.output_bytes)
-                        .await?
+                    write_sparse_stream_chunk(
+                        device,
+                        &mut input,
+                        image,
+                        written,
+                        chunk.output_bytes,
+                    )
+                    .await?
                 }
                 SparseChunkKind::Fill => {
                     let mut fill = [0u8; 4];
@@ -859,8 +1060,8 @@ fn gpt_tables_for_firmware(
     let Some(parameter) = images.iter().find(|image| is_parameter_image(image)) else {
         return Ok(None);
     };
-    let bytes = std::fs::read(&parameter.path)
-        .map_err(|e| format!("Read parameter image failed: {e}"))?;
+    let bytes =
+        std::fs::read(&parameter.path).map_err(|e| format!("Read parameter image failed: {e}"))?;
     let Some(partitions) = parse_gpt_parameter(&bytes)? else {
         return Ok(None);
     };
@@ -888,7 +1089,11 @@ async fn write_gpt_tables(
     Ok(())
 }
 
-async fn write_gpt_bytes(device: &mut Device, start_sector: u32, data: &[u8]) -> Result<(), String> {
+async fn write_gpt_bytes(
+    device: &mut Device,
+    start_sector: u32,
+    data: &[u8],
+) -> Result<(), String> {
     for (index, chunk) in data.chunks(WRITE_LBA_CHUNK).enumerate() {
         let sector_offset = u32::try_from(index * (WRITE_LBA_CHUNK / SECTOR_SIZE))
             .map_err(|_| "GPT LBA address overflows".to_string())?;
@@ -920,9 +1125,24 @@ fn create_upgrade_temp_dir() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-async fn wait_for_loader_device(state: &AppState) -> Result<Device, String> {
+fn loader_ready_progress_percent(attempt: usize) -> u64 {
+    (attempt as u64 * 100) / LOADER_READY_RETRIES as u64
+}
+
+fn download_requires_reset(has_images: bool) -> bool {
+    has_images
+}
+
+async fn wait_for_loader_device(app: &AppHandle, state: &AppState) -> Result<Device, String> {
     let mut last_status = String::from("Loader is still starting");
-    for _ in 0..LOADER_READY_RETRIES {
+    for attempt in 0..LOADER_READY_RETRIES {
+        emit_progress(
+            app,
+            format!(
+                "Waiting for Loader... ({}%)",
+                loader_ready_progress_percent(attempt)
+            ),
+        );
         match open_selected_device(state).await {
             Ok(mut device) => {
                 let probe = device
@@ -931,6 +1151,8 @@ async fn wait_for_loader_device(state: &AppState) -> Result<Device, String> {
                     .map(|_| ())
                     .map_err(|err| format!("Flash is not ready: {err}"));
                 if !loader_flash_probe_needs_retry(&probe) {
+                    emit_progress(app, "Waiting for Loader... (100%)".to_string());
+                    emit_log(app, "Loader is ready");
                     return Ok(device);
                 }
                 last_status = probe.unwrap_err();
@@ -968,7 +1190,10 @@ pub async fn upgrade_firmware(
     };
     let result = async {
         emit_log(&app, &format!("> rockusb upgrade {path}"));
-        emit_log(&app, &format!("Extracting firmware to {}", temp_dir.display()));
+        emit_log(
+            &app,
+            &format!("Extracting firmware to {}", temp_dir.display()),
+        );
         let extract_path = path.clone();
         let extract_dir = temp_dir.clone();
         let firmware = tauri::async_runtime::spawn_blocking(move || {
@@ -980,14 +1205,18 @@ pub async fn upgrade_firmware(
 
         let mut device = if selected_device_is_maskrom(state.inner()).await? {
             let loader_path = firmware.loader_path.as_ref().ok_or_else(|| {
-                "Firmware has no download.bin or MiniLoaderAll.bin for Maskrom Boot download".to_string()
+                "Firmware has no download.bin or MiniLoaderAll.bin for Maskrom Boot download"
+                    .to_string()
             })?;
-            emit_log(&app, &format!("Downloading Loader: {}", loader_path.display()));
+            emit_log(
+                &app,
+                &format!("Downloading Loader: {}", loader_path.display()),
+            );
             let mut maskrom_device = open_selected_device(state.inner()).await?;
             let loader_log = download_boot_to_device(&mut maskrom_device, loader_path).await?;
             emit_lines(&app, &loader_log);
             drop(maskrom_device);
-            wait_for_loader_device(state.inner()).await?
+            wait_for_loader_device(&app, state.inner()).await?
         } else {
             open_selected_device(state.inner()).await?
         };
@@ -1044,11 +1273,157 @@ pub async fn download_boot(
         return Err(format!("Boot/Loader file not found: {path}"));
     }
 
-    with_busy_device(&app, &state, &format!("download-boot {path}"), move |mut device| async move {
-        let log = download_boot_to_device(&mut device, &boot_path).await?;
-        Ok(((), log))
-    })
+    with_busy_device(
+        &app,
+        &state,
+        &format!("download-boot {path}"),
+        move |mut device| async move {
+            let log = download_boot_to_device(&mut device, &boot_path).await?;
+            Ok(((), log))
+        },
+    )
     .await
+}
+
+async fn switch_download_storage(
+    app: &AppHandle,
+    device: &mut Device,
+    storage: &str,
+) -> Result<(), String> {
+    let no = storage_name_to_ui_no(storage)?;
+    let target = storage_from_ui_no(no)?;
+    device
+        .switch_storage(target)
+        .await
+        .map_err(|e| format!("Switch storage to {} failed: {e}", storage.trim()))?;
+    let current = device
+        .storage()
+        .await
+        .map_err(|e| format!("Verify storage switch failed: {e}"))?;
+    if current != target {
+        return Err(format!(
+            "Storage switch to {} was not applied; device reports {}",
+            storage.trim(),
+            storage_to_ui(current).name
+        ));
+    }
+    emit_log(
+        app,
+        &format!(
+            "Switched storage to {}",
+            storage.trim().to_ascii_uppercase()
+        ),
+    );
+    Ok(())
+}
+
+/// Execute Download Image page writes through RockUSB without invoking upgrade_tool.
+pub async fn download_execute(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: DownloadExecutePayload,
+) -> Result<(), String> {
+    let rows: Vec<_> = payload
+        .rows
+        .into_iter()
+        .filter(|row| row.enabled && !row.path.trim().is_empty())
+        .collect();
+    if rows.is_empty() {
+        return Err("Enable at least one row and provide an image path".to_string());
+    }
+
+    let loader_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.name.trim().eq_ignore_ascii_case("loader"))
+        .collect();
+    if loader_rows.len() > 1 {
+        return Err("Only one Loader row can be written at a time".to_string());
+    }
+
+    devices::ensure_backend_not_busy(state.inner())?;
+    devices::set_backend_busy(state.inner(), true)?;
+    let result = async {
+        emit_log(&app, "> rockusb download-image");
+        let mut device = open_selected_device(state.inner()).await?;
+        let loader_storage = loader_rows
+            .first()
+            .map(|row| row.storage.trim())
+            .filter(|storage| !storage.is_empty())
+            .map(str::to_string);
+
+        if let Some(loader) = loader_rows.first() {
+            let was_maskrom = selected_device_is_maskrom(state.inner()).await?;
+            emit_log(&app, &format!("Downloading Loader: {}", loader.path));
+            let log = download_boot_to_device(&mut device, Path::new(&loader.path)).await?;
+            emit_lines(&app, &log);
+            if was_maskrom {
+                drop(device);
+                device = wait_for_loader_device(&app, state.inner()).await?;
+            }
+        }
+
+        let has_images = rows
+            .iter()
+            .any(|row| !row.name.trim().eq_ignore_ascii_case("loader"));
+        if !has_images {
+            emit_log(&app, "Download image succeeded");
+            return Ok(());
+        }
+
+        let mut active_storage: Option<String> = None;
+        for row in rows
+            .iter()
+            .filter(|row| !row.name.trim().eq_ignore_ascii_case("loader"))
+        {
+            let requested_storage = if row.storage.trim().is_empty() {
+                loader_storage.as_deref()
+            } else {
+                Some(row.storage.trim())
+            };
+            if let Some(storage) = requested_storage {
+                let storage = storage.to_ascii_uppercase();
+                if active_storage.as_deref() != Some(storage.as_str()) {
+                    switch_download_storage(&app, &mut device, &storage).await?;
+                    active_storage = Some(storage);
+                }
+            }
+
+            let partition = if payload.force_by_address {
+                DownloadPartition {
+                    name: row.name.trim().to_string(),
+                    start_sector: parse_download_lba(&row.address)?,
+                    sector_count: None,
+                }
+            } else {
+                let partitions = read_download_partitions(&mut device).await?;
+                resolve_download_partition(&partitions, &row.name)?
+            };
+            let flash_sectors = device
+                .flash_info()
+                .await
+                .map_err(|e| format!("Read Flash info failed: {e}"))?
+                .sectors();
+            if flash_sectors == 0 {
+                return Err("Flash reports 0 sectors".to_string());
+            }
+            let image = image_for_download(&row.name, &row.path, partition)?;
+            let line = write_firmware_image(&app, &mut device, &image, flash_sectors).await?;
+            emit_log(&app, &line);
+        }
+
+        if download_requires_reset(has_images) {
+            device
+                .reset_device(ResetOpcode::Reset)
+                .await
+                .map_err(|e| format!("Reset device after image download failed: {e}"))?;
+            emit_log(&app, "Reset Device Success");
+        }
+        emit_log(&app, "Download image succeeded");
+        Ok(())
+    }
+    .await;
+    let _ = devices::set_backend_busy(state.inner(), false);
+    result
 }
 
 /// Test device connectivity via Test Unit Ready (rkdeveloptool / upgrade_tool `TD`).
@@ -1070,18 +1445,23 @@ pub async fn reset_device(
     opcode: ResetOpcode,
 ) -> Result<String, String> {
     let label = opcode.to_string();
-    with_busy_device(&app, &state, &format!("reset-device {label}"), move |mut device| async move {
-        device
-            .reset_device(opcode)
-            .await
-            .map_err(|e| format!("Reset device failed: {e}"))?;
-        let output = match opcode {
-            ResetOpcode::Maskrom => "Enter Maskrom Success".to_string(),
-            ResetOpcode::Reset => "Reset Device Success".to_string(),
-            other => format!("Reset device ({other}) success"),
-        };
-        Ok((output.clone(), output))
-    })
+    with_busy_device(
+        &app,
+        &state,
+        &format!("reset-device {label}"),
+        move |mut device| async move {
+            device
+                .reset_device(opcode)
+                .await
+                .map_err(|e| format!("Reset device failed: {e}"))?;
+            let output = match opcode {
+                ResetOpcode::Maskrom => "Enter Maskrom Success".to_string(),
+                ResetOpcode::Reset => "Reset Device Success".to_string(),
+                other => format!("Reset device ({other}) success"),
+            };
+            Ok((output.clone(), output))
+        },
+    )
     .await
 }
 
@@ -1137,9 +1517,8 @@ pub async fn erase_sectors(
                     format!("Erase LBA failed at sector {offset} (count {chunk}): {e}")
                 })?;
             }
-            let output = format!(
-                "Erase sectors OK: start={start}, count={count}, chunks={chunk_total}"
-            );
+            let output =
+                format!("Erase sectors OK: start={start}, count={count}, chunks={chunk_total}");
             Ok((output.clone(), output))
         },
     )
@@ -1183,20 +1562,14 @@ fn flash_block_count(info: &FlashInfo) -> Result<u32, String> {
 ///
 /// Expects Loader mode (user downloads Boot separately). Direct LBA / eMMC uses
 /// `EraseLBA` from sector 0; otherwise `EraseForce` by flash blocks (CS0).
-pub async fn erase_all(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn erase_all(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     let app_for_progress = app.clone();
     with_busy_device(&app, &state, "erase-flash", move |mut device| async move {
-        let info = device
-            .flash_info()
-            .await
-            .map_err(|e| {
-                format!(
-                    "Read Flash info failed: {e} (in Maskrom, download Boot/Loader first, then retry)"
-                )
-            })?;
+        let info = device.flash_info().await.map_err(|e| {
+            format!(
+                "Read Flash info failed: {e} (in Maskrom, download Boot/Loader first, then retry)"
+            )
+        })?;
         let sectors = info.sectors();
         if sectors == 0 {
             return Err("Flash reports 0 sectors".to_string());
@@ -1281,7 +1654,10 @@ pub async fn export_image(
     let out = Path::new(&output_path).to_path_buf();
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            return Err(format!("Output directory does not exist: {}", parent.display()));
+            return Err(format!(
+                "Output directory does not exist: {}",
+                parent.display()
+            ));
         }
     }
 
@@ -1497,6 +1873,19 @@ mod tests {
     }
 
     #[test]
+    fn loader_ready_progress_increases_across_retry_attempts() {
+        assert_eq!(loader_ready_progress_percent(0), 0);
+        assert!(loader_ready_progress_percent(1) > 0);
+        assert!(loader_ready_progress_percent(LOADER_READY_RETRIES - 1) < 100);
+    }
+
+    #[test]
+    fn download_resets_only_after_an_image_was_written() {
+        assert!(!download_requires_reset(false));
+        assert!(download_requires_reset(true));
+    }
+
+    #[test]
     fn ui_storage_roundtrip_common() {
         for no in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
             let idx = storage_from_ui_no(no).unwrap();
@@ -1520,10 +1909,7 @@ mod tests {
         let info = storage_to_ui(StorageIndex::MtdBlkSpiNand);
         assert_eq!(info.no, 6);
         assert_eq!(info.name, "SPINAND");
-        assert_eq!(
-            storage_from_ui_no(6).unwrap(),
-            StorageIndex::MtdBlkSpiNand
-        );
+        assert_eq!(storage_from_ui_no(6).unwrap(), StorageIndex::MtdBlkSpiNand);
     }
 
     #[test]
@@ -1561,10 +1947,7 @@ mod tests {
     #[test]
     fn erase_block_chunks_respect_max() {
         assert_eq!(erase_block_chunks(1).unwrap(), vec![(0, 1)]);
-        assert_eq!(
-            erase_block_chunks(20).unwrap(),
-            vec![(0, 16), (16, 4)]
-        );
+        assert_eq!(erase_block_chunks(20).unwrap(), vec![(0, 16), (16, 4)]);
         assert!(erase_block_chunks(0).is_err());
     }
 
@@ -1576,5 +1959,43 @@ mod tests {
         raw[4..6].copy_from_slice(&256u16.to_le_bytes()); // block size in sectors (128KiB)
         let info = FlashInfo::from_bytes(raw);
         assert_eq!(flash_block_count(&info).unwrap(), 2048);
+    }
+
+    #[test]
+    fn download_address_accepts_hexadecimal_and_decimal_lba() {
+        assert_eq!(parse_download_lba("0x00002000").unwrap(), 0x2000);
+        assert_eq!(parse_download_lba("8192").unwrap(), 0x2000);
+        assert!(parse_download_lba("0xnope").is_err());
+    }
+
+    #[test]
+    fn resolves_download_partition_without_case_sensitivity() {
+        let partitions = vec![DownloadPartition {
+            name: "boot".to_string(),
+            start_sector: 0xc800,
+            sector_count: Some(0x14000),
+        }];
+
+        let target = resolve_download_partition(&partitions, "BOOT").unwrap();
+        assert_eq!(target.start_sector, 0xc800);
+        assert_eq!(target.sector_count, Some(0x14000));
+    }
+
+    #[test]
+    fn reads_download_partitions_from_gpt_entries() {
+        let parameter = b"TYPE: GPT\0CMDLINE:mtdparts=rk29xxnand:0x00002000@0x00002000(uboot),0x00014000@0x0000c800(boot)\0";
+        let source = parse_gpt_parameter(parameter).unwrap().unwrap();
+        let tables = build_gpt_tables(&source, 0x0080_0000).unwrap();
+
+        let partitions = parse_gpt_download_partitions(
+            &tables.primary[SECTOR_SIZE..SECTOR_SIZE * 2],
+            &tables.primary[SECTOR_SIZE * 2..],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(partitions[1].name, "boot");
+        assert_eq!(partitions[1].start_sector, 0xc800);
+        assert_eq!(partitions[1].sector_count, Some(0x14000));
     }
 }

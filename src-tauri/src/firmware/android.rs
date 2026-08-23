@@ -6,8 +6,7 @@ const GPT_PRIMARY_SECTORS: u64 = 2 + GPT_ENTRY_SECTORS;
 const GPT_BACKUP_SECTORS: u64 = 1 + GPT_ENTRY_SECTORS;
 
 const BASIC_DATA_GUID: [u8; 16] = [
-    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99,
-    0xc7,
+    0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
 ];
 const DISK_GUID: [u8; 16] = [
     0x52, 0x4b, 0x44, 0x54, 0x4f, 0x4f, 0x4c, 0x00, 0x91, 0x80, 0x64, 0x65, 0x76, 0x74, 0x6f, 0x6f,
@@ -58,9 +57,18 @@ pub(crate) fn parse_gpt_parameter(data: &[u8]) -> Result<Option<Vec<GptPartition
         return Ok(None);
     }
 
-    let cmdline_start = text
-        .find("CMDLINE:")
-        .ok_or_else(|| "GPT parameter has no CMDLINE".to_string())?;
+    parse_parameter_partitions(data)?
+        .ok_or_else(|| "GPT parameter has no CMDLINE".to_string())
+        .map(Some)
+}
+
+/// Parse Rockchip's mtdparts command line from either a legacy or GPT parameter image.
+pub(crate) fn parse_parameter_partitions(data: &[u8]) -> Result<Option<Vec<GptPartition>>, String> {
+    let text = String::from_utf8_lossy(data);
+    let Some(cmdline_start) = text.find("CMDLINE:") else {
+        return Ok(None);
+    };
+
     let cmdline = text[cmdline_start + "CMDLINE:".len()..]
         .split('\0')
         .next()
@@ -103,7 +111,7 @@ pub(crate) fn parse_gpt_parameter(data: &[u8]) -> Result<Option<Vec<GptPartition
     }
 
     if partitions.is_empty() {
-        return Err("GPT parameter has no partitions".to_string());
+        return Err("Parameter has no partitions".to_string());
     }
     Ok(Some(partitions))
 }
@@ -123,7 +131,9 @@ pub(crate) fn parse_sparse_header(data: &[u8]) -> Result<Option<SparseHeader>, S
     let total_chunks = u32::from_le_bytes(data[20..24].try_into().unwrap());
 
     if major_version != 1 {
-        return Err(format!("Unsupported Android sparse major version: {major_version}"));
+        return Err(format!(
+            "Unsupported Android sparse major version: {major_version}"
+        ));
     }
     if file_header_size < 28 || chunk_header_size < 12 {
         return Err("Invalid Android sparse header size".to_string());
@@ -166,10 +176,16 @@ pub(crate) fn parse_sparse_chunk_header(
         0xcac2 => (SparseChunkKind::Fill, 4, output_bytes),
         0xcac3 => (SparseChunkKind::DontCare, 0, output_bytes),
         0xcac4 => (SparseChunkKind::Crc32, 4, 0),
-        _ => return Err(format!("Unsupported Android sparse chunk type: 0x{chunk_type:04x}")),
+        _ => {
+            return Err(format!(
+                "Unsupported Android sparse chunk type: 0x{chunk_type:04x}"
+            ))
+        }
     };
     if total_size != header_size + expected_payload {
-        return Err(format!("Invalid Android sparse chunk size for 0x{chunk_type:04x}"));
+        return Err(format!(
+            "Invalid Android sparse chunk size for 0x{chunk_type:04x}"
+        ));
     }
 
     Ok(SparseChunk {
@@ -204,18 +220,26 @@ pub(crate) fn build_gpt_tables(
             None => last_usable,
         };
         if partition.start_sector < first_usable || end_sector > last_usable {
-            return Err(format!("GPT partition {} is outside the usable flash range", partition.name));
+            return Err(format!(
+                "GPT partition {} is outside the usable flash range",
+                partition.name
+            ));
         }
         resolved.push((partition, end_sector));
     }
     let mut ranges: Vec<_> = resolved
         .iter()
-        .map(|(partition, end_sector)| (partition.start_sector, *end_sector, partition.name.as_str()))
+        .map(|(partition, end_sector)| {
+            (partition.start_sector, *end_sector, partition.name.as_str())
+        })
         .collect();
     ranges.sort_unstable_by_key(|range| range.0);
     for pair in ranges.windows(2) {
         if pair[0].1 >= pair[1].0 {
-            return Err(format!("GPT partitions {} and {} overlap", pair[0].2, pair[1].2));
+            return Err(format!(
+                "GPT partitions {} and {} overlap",
+                pair[0].2, pair[1].2
+            ));
         }
     }
 
@@ -272,8 +296,11 @@ fn parse_hex_sector(value: &str) -> Result<u64, String> {
 fn write_protective_mbr(mbr: &mut [u8], flash_sectors: u64) {
     mbr[446 + 4] = 0xee;
     mbr[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
-    mbr[446 + 12..446 + 16]
-        .copy_from_slice(&u32::try_from(flash_sectors.saturating_sub(1)).unwrap_or(u32::MAX).to_le_bytes());
+    mbr[446 + 12..446 + 16].copy_from_slice(
+        &u32::try_from(flash_sectors.saturating_sub(1))
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
 }
 
@@ -343,14 +370,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_legacy_parameter_partition_ranges_without_gpt_marker() {
+        let parameter = b"PARM\0CMDLINE:mtdparts=rk29xxnand:0x00002000@0x00002000(uboot),0x00014000@0x0000c800(boot),-@0x00020800(rootfs)\0";
+        let partitions = parse_parameter_partitions(parameter).unwrap().unwrap();
+
+        assert_eq!(partitions[1].name, "boot");
+        assert_eq!(partitions[1].start_sector, 0xc800);
+        assert_eq!(partitions[2].sector_count, None);
+    }
+
+    #[test]
     fn generated_gpt_contains_the_primary_header_and_named_partition() {
         let partitions = parse_gpt_parameter(PARAMETER).unwrap().unwrap();
         let tables = build_gpt_tables(&partitions, 0x0080_0000).unwrap();
 
         assert_eq!(&tables.primary[512..520], b"EFI PART");
         let boot_entry = 2 * 512 + 2 * 128;
-        assert_eq!(u64::from_le_bytes(tables.primary[boot_entry + 32..boot_entry + 40].try_into().unwrap()), 0xc800);
-        assert_eq!(u64::from_le_bytes(tables.primary[boot_entry + 40..boot_entry + 48].try_into().unwrap()), 0x207ff);
+        assert_eq!(
+            u64::from_le_bytes(
+                tables.primary[boot_entry + 32..boot_entry + 40]
+                    .try_into()
+                    .unwrap()
+            ),
+            0xc800
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                tables.primary[boot_entry + 40..boot_entry + 48]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x207ff
+        );
         assert_eq!(tables.backup_start_sector, 0x0080_0000 - 33);
     }
 
@@ -360,8 +411,22 @@ mod tests {
         let tables = build_gpt_tables(&partitions, 0x0080_0000).unwrap();
         let userdata_entry = 2 * 512 + 3 * 128;
 
-        assert_eq!(u64::from_le_bytes(tables.primary[userdata_entry + 32..userdata_entry + 40].try_into().unwrap()), 0x20800);
-        assert_eq!(u64::from_le_bytes(tables.primary[userdata_entry + 40..userdata_entry + 48].try_into().unwrap()), 0x0080_0000 - 34);
+        assert_eq!(
+            u64::from_le_bytes(
+                tables.primary[userdata_entry + 32..userdata_entry + 40]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x20800
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                tables.primary[userdata_entry + 40..userdata_entry + 48]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x0080_0000 - 34
+        );
     }
 
     #[test]
