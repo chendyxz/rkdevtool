@@ -579,47 +579,6 @@ fn command_matches_success(args: &[String], output: &str, exit_ok: bool) -> bool
     }
 }
 
-fn tool_error_summary(output: &str) -> String {
-    let mut last = String::from("Unknown error");
-    for line in output.lines() {
-        let line = strip_ansi(line);
-        if line.is_empty() {
-            continue;
-        }
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("fail")
-            || lower.contains("error")
-            || lower.contains("失败")
-            || lower.contains("invalid argument")
-            || lower.contains("请检查")
-        {
-            last = line;
-        }
-    }
-    last
-}
-
-#[cfg(target_os = "linux")]
-fn linux_usb_permission_hint(output: &str) -> &'static str {
-    let lower = strip_ansi(output).to_ascii_lowercase();
-    if lower.contains("comm object failed")
-        || lower.contains("permission denied")
-        || lower.contains("couldn't open device")
-        || lower.contains("could not open device")
-        || lower.contains("access denied")
-        || lower.contains("open usb device failed")
-    {
-        " (USB permission denied: install the .deb package, or run packaging/linux/install-udev.sh)"
-    } else {
-        ""
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn linux_usb_permission_hint(_output: &str) -> &'static str {
-    ""
-}
-
 #[cfg(target_os = "linux")]
 fn shell_quote(arg: &str) -> String {
     if arg.is_empty() {
@@ -1064,47 +1023,6 @@ pub async fn partition_list(app: AppHandle, state: State<'_, AppState>) -> Resul
         return Err("Failed to read partition table".to_string());
     }
     Ok(result.output)
-}
-
-#[tauri::command]
-pub async fn upgrade_firmware(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    path: String,
-    no_reset: Option<bool>,
-) -> Result<(), String> {
-    let mut args = vec![String::from("UF"), path];
-    if no_reset.unwrap_or(false) {
-        args.push(String::from("-noreset"));
-    }
-
-    let result = with_tool(app, state, move |app, tool, dir, device| {
-        run_tool_sync(app, tool, dir, device, &args, false)
-    })
-    .await?;
-
-    if !result.success {
-        let detail = if output_has_error(&result.output) {
-            tool_error_summary(&result.output)
-        } else if result.output.trim().is_empty() {
-            "upgrade_tool produced no output (check firmware path and security software)".to_string()
-        } else {
-            "Upgrade firmware ok / Success not detected".to_string()
-        };
-        let hint = if !linux_usb_permission_hint(&result.output).is_empty() {
-            linux_usb_permission_hint(&result.output)
-        } else if detail.to_ascii_lowercase().contains("read chip info fail") {
-            " (In Maskrom, download Boot first; on Mac v2.13 try Linux v2.44+ if this chip is unsupported)"
-        } else if detail.contains("ftruncate") {
-            " (Use update.img firmware package, not download.bin / Loader file)"
-        } else if detail == "Upgrade firmware ok / Success not detected" {
-            " (If the device is unresponsive, re-enter Maskrom and retry)"
-        } else {
-            ""
-        };
-        return Err(format!("Firmware upgrade failed: {detail}{hint}"));
-    }
-    Ok(())
 }
 
 #[tauri::command]

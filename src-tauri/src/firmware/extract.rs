@@ -3,11 +3,42 @@ use std::ffi::CStr;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct FirmwareImage {
+    pub name: String,
+    pub path: PathBuf,
+    pub flash_offset_sectors: u64,
+    pub flash_size_sectors: u64,
+    pub byte_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractedFirmware {
+    pub images: Vec<FirmwareImage>,
+    pub loader_path: Option<PathBuf>,
+    pub log: String,
+}
 
 pub fn extract_firmware_file(path: &str, output_dir: &str) -> Result<String, String> {
+    Ok(extract_firmware(path, output_dir, false)?.log)
+}
+
+pub fn extract_firmware_for_upgrade(
+    path: &str,
+    output_dir: &str,
+) -> Result<ExtractedFirmware, String> {
+    extract_firmware(path, output_dir, true)
+}
+
+fn extract_firmware(
+    path: &str,
+    output_dir: &str,
+    keep_boot_file: bool,
+) -> Result<ExtractedFirmware, String> {
     let path = Path::new(path);
-    if !path.exists() {
+    if !path.is_file() {
         return Err(format!("File not found: {}", path.display()));
     }
 
@@ -19,23 +50,48 @@ pub fn extract_firmware_file(path: &str, output_dir: &str) -> Result<String, Str
 
     let mut log = String::new();
 
+    let mut images = Vec::new();
+    let mut loader_path = None;
+
     match signature {
-        [b'R', b'K', b'A', b'F'] => unpack_rkaf(path, output_dir, &mut log)?,
+        [b'R', b'K', b'A', b'F'] => {
+            unpack_rkaf(path, output_dir, &mut log, &mut images, &mut loader_path)?
+        }
         [b'R', b'K', b'F', b'W'] => {
             let buf = read_file(path)?;
             unpack_rkfw(&buf, output_dir, &mut log)?;
 
             let embedded = Path::new(output_dir).join("embedded-update.img");
             if embedded.exists() {
-                unpack_rkaf(&embedded, output_dir, &mut log)?;
+                unpack_rkaf(
+                    &embedded,
+                    output_dir,
+                    &mut log,
+                    &mut images,
+                    &mut loader_path,
+                )?;
                 let _ = std::fs::remove_file(&embedded);
-                let _ = std::fs::remove_file(Path::new(output_dir).join("BOOT"));
+                let boot_path = Path::new(output_dir).join("BOOT");
+                if loader_path.is_none() && boot_path.is_file() {
+                    loader_path = Some(boot_path.clone());
+                }
+                if !keep_boot_file {
+                    let _ = std::fs::remove_file(boot_path);
+                }
             }
         }
         _ => return Err("Unsupported firmware format (RKFW or RKAF/update.img required)".to_string()),
     }
 
-    Ok(log)
+    if images.is_empty() {
+        return Err("Firmware package contains no writable images".to_string());
+    }
+
+    Ok(ExtractedFirmware {
+        images,
+        loader_path,
+        log,
+    })
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -110,7 +166,13 @@ fn unpack_rkfw(buf: &[u8], output_dir: &str, log: &mut String) -> Result<(), Str
     Ok(())
 }
 
-fn unpack_rkaf(path: &Path, output_dir: &str, log: &mut String) -> Result<(), String> {
+fn unpack_rkaf(
+    path: &Path,
+    output_dir: &str,
+    log: &mut String,
+    images: &mut Vec<FirmwareImage>,
+    loader_path: &mut Option<PathBuf>,
+) -> Result<(), String> {
     let mut fp = File::open(path).map_err(|e| e.to_string())?;
     let mut header_buf = vec![0u8; mem::size_of::<UpdateHeader>()];
     fp.read_exact(&mut header_buf).map_err(|e| e.to_string())?;
@@ -170,8 +232,8 @@ fn unpack_rkaf(path: &Path, output_dir: &str, log: &mut String) -> Result<(), St
             continue;
         }
 
-        let file_name = normalize_part_path(&part_full_path);
-        let output_path = Path::new(output_dir).join(&file_name);
+        let relative_path = safe_relative_path(&part_full_path)?;
+        let output_path = Path::new(output_dir).join(relative_path);
         extract_part(
             &mut fp,
             part_offset as u64,
@@ -179,6 +241,26 @@ fn unpack_rkaf(path: &Path, output_dir: &str, log: &mut String) -> Result<(), St
             &output_path,
             log,
         )?;
+
+        if is_loader_file_name(&part_full_path) {
+            *loader_path = Some(output_path.clone());
+        }
+
+        if !has_flash_target(flash_offset) {
+            continue;
+        }
+
+        images.push(FirmwareImage {
+            name: if part_name.trim().is_empty() {
+                part_full_path.clone()
+            } else {
+                part_name
+            },
+            path: output_path,
+            flash_offset_sectors: u64::from(flash_offset),
+            flash_size_sectors: u64::from(flash_size),
+            byte_count: u64::from(part_byte_count),
+        });
     }
 
     push_log(
@@ -189,11 +271,38 @@ fn unpack_rkaf(path: &Path, output_dir: &str, log: &mut String) -> Result<(), St
     Ok(())
 }
 
-fn normalize_part_path(full_path: &str) -> String {
-    full_path
-        .trim_start_matches("./")
-        .trim_start_matches(".\\")
-        .replace('\\', "/")
+fn safe_relative_path(full_path: &str) -> Result<PathBuf, String> {
+    let normalized = full_path.replace('\\', "/");
+    let mut output = PathBuf::new();
+
+    for component in Path::new(&normalized).components() {
+        match component {
+            Component::Normal(part) => output.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("Unsafe firmware entry path: {full_path}"));
+            }
+        }
+    }
+
+    if output.as_os_str().is_empty() {
+        return Err("Firmware entry path is empty".to_string());
+    }
+    Ok(output)
+}
+
+pub(crate) fn is_loader_file_name(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file_name = Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    file_name.eq_ignore_ascii_case("download.bin")
+        || file_name.eq_ignore_ascii_case("MiniLoaderAll.bin")
+}
+
+fn has_flash_target(flash_offset: u32) -> bool {
+    flash_offset != u32::MAX
 }
 
 fn extract_part(
@@ -251,4 +360,31 @@ fn cstr_field(bytes: &[u8]) -> String {
     CStr::from_bytes_until_nul(bytes)
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_flash_target, is_loader_file_name, safe_relative_path};
+    use std::path::PathBuf;
+
+    #[test]
+    fn recognizes_the_supported_loader_filenames() {
+        assert!(is_loader_file_name("download.bin"));
+        assert!(is_loader_file_name("MiniLoaderAll.bin"));
+        assert!(is_loader_file_name("MINILOADERALL.BIN"));
+        assert!(!is_loader_file_name("uboot.img"));
+    }
+
+    #[test]
+    fn excludes_entries_without_a_flash_target_from_lba_writes() {
+        assert!(has_flash_target(0x4000));
+        assert!(!has_flash_target(u32::MAX));
+    }
+
+    #[test]
+    fn rejects_firmware_paths_that_escape_the_output_directory() {
+        assert!(safe_relative_path("../outside.img").is_err());
+        assert!(safe_relative_path("/absolute.img").is_err());
+        assert_eq!(safe_relative_path("Image/boot.img").unwrap(), PathBuf::from("Image/boot.img"));
+    }
 }

@@ -2,9 +2,9 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, State};
 
@@ -15,6 +15,11 @@ use rockusb::nusb::Device;
 use rockusb::protocol::{Capability, ChipInfo, FlashId, FlashInfo, ResetOpcode, StorageIndex};
 
 use crate::devices::{self, format_location_id_for, is_rockusb_device_info};
+use crate::firmware::{
+    build_gpt_tables, extract_firmware_for_upgrade, parse_gpt_parameter,
+    parse_sparse_chunk_header, parse_sparse_header, FirmwareImage, GptTables, SparseChunkKind,
+    SparseHeader,
+};
 use crate::state::AppState;
 use crate::upgrade_tool::{CurrentStorageInfo, LogPayload};
 
@@ -28,6 +33,37 @@ const ERASE_BLOCK_CHUNK: u16 = 16;
 
 /// Match rkdeveloptool `DEFAULT_RW_LBA` / rockusb `MAXIO_SIZE` (128 sectors).
 const READ_LBA_CHUNK: u32 = 128;
+
+const SECTOR_SIZE: usize = 512;
+const WRITE_LBA_CHUNK: usize = READ_LBA_CHUNK as usize * SECTOR_SIZE;
+const LOADER_READY_RETRIES: usize = 20;
+const LOADER_READY_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LbaWriteChunk {
+    start_sector: u32,
+    source_len: usize,
+    transfer_len: usize,
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        return format!("{bytes} B");
+    }
+
+    let value = format!("{value:.2}");
+    let value = value.trim_end_matches('0').trim_end_matches('.');
+    format!("{value} {}", UNITS[unit_index])
+}
 
 fn emit_log(app: &AppHandle, text: &str) {
     if text.is_empty() {
@@ -49,6 +85,21 @@ fn emit_log(app: &AppHandle, text: &str) {
             in_place: false,
         },
     );
+}
+
+fn emit_progress(app: &AppHandle, text: String) {
+    let _ = app.emit(
+        EVENT_TOOL_LOG,
+        LogPayload {
+            text,
+            level: "default".to_string(),
+            in_place: true,
+        },
+    );
+}
+
+fn should_emit_progress(last_percent: Option<u64>, percent: u64) -> bool {
+    last_percent != Some(percent)
 }
 
 fn emit_lines(app: &AppHandle, text: &str) {
@@ -239,6 +290,34 @@ async fn open_selected_device(state: &AppState) -> Result<Device, String> {
         .map_err(|e| format!("Failed to open RockUSB device: {e}"))
 }
 
+async fn selected_device_is_maskrom(state: &AppState) -> Result<bool, String> {
+    let selected = state
+        .selected_device
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let infos: Vec<_> = rockusb::nusb::devices()
+        .await
+        .map_err(|e| format!("Failed to list USB devices: {e}"))?
+        .filter(is_rockusb_device_info)
+        .collect();
+
+    let info = if let Some(location_id) = selected.as_deref().filter(|s| !s.is_empty()) {
+        infos
+            .into_iter()
+            .find(|d| format_location_id_for(d) == location_id)
+            .ok_or_else(|| format!("Selected device {location_id} is no longer connected"))?
+    } else if infos.len() == 1 {
+        infos.into_iter().next().unwrap()
+    } else if infos.is_empty() {
+        return Err("No Rockchip device found (enter Maskrom/Loader)".to_string());
+    } else {
+        return Err("Multiple devices connected; select one in the status bar".to_string());
+    };
+
+    Ok(info.usb_version() & 1 == 0)
+}
+
 async fn with_busy_device<F, Fut, T>(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -420,7 +499,540 @@ async fn download_boot_entry(
     Ok(())
 }
 
-/// Download Boot / Loader into Maskrom (upgrade_tool `DB`).
+async fn download_boot_to_device(device: &mut Device, boot_path: &Path) -> Result<String, String> {
+    let mut file = File::open(boot_path).map_err(|e| format!("Open boot file failed: {e}"))?;
+    let mut header_bytes: RkBootHeaderBytes = [0; 102];
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| format!("Read boot header failed: {e}"))?;
+    let header = RkBootHeader::from_bytes(&header_bytes).ok_or_else(|| {
+        "Failed to parse Loader/Boot header (use MiniLoaderAll.bin or download.bin)".to_string()
+    })?;
+
+    let mut log = String::from("Download Boot Start\n");
+    download_boot_entry(device, header.entry_471, 0x471, &mut file, &mut log).await?;
+    download_boot_entry(device, header.entry_472, 0x472, &mut file, &mut log).await?;
+    log.push_str("Download Boot Success");
+    Ok(log)
+}
+
+fn write_lba_chunk_plan(mut start_sector: u64, byte_count: u64) -> Result<Vec<LbaWriteChunk>, String> {
+    if byte_count == 0 {
+        return Err("Firmware image is empty".to_string());
+    }
+
+    let last_sector = start_sector
+        .checked_add(byte_count.div_ceil(SECTOR_SIZE as u64).saturating_sub(1))
+        .ok_or_else(|| "Firmware image sector range overflows".to_string())?;
+    if last_sector > u64::from(u32::MAX) {
+        return Err("Firmware image exceeds the RockUSB LBA address range".to_string());
+    }
+
+    let mut remaining = usize::try_from(byte_count)
+        .map_err(|_| "Firmware image is too large for this platform".to_string())?;
+    let mut chunks = Vec::new();
+    while remaining > 0 {
+        let source_len = remaining.min(WRITE_LBA_CHUNK);
+        let transfer_len = source_len.next_multiple_of(SECTOR_SIZE);
+        chunks.push(LbaWriteChunk {
+            start_sector: start_sector as u32,
+            source_len,
+            transfer_len,
+        });
+        start_sector += (transfer_len / SECTOR_SIZE) as u64;
+        remaining -= source_len;
+    }
+    Ok(chunks)
+}
+
+async fn write_firmware_image(
+    app: &AppHandle,
+    device: &mut Device,
+    image: &FirmwareImage,
+    flash_sectors: u32,
+) -> Result<String, String> {
+    if let Some((input, sparse)) = open_android_sparse_image(&image.path)? {
+        return write_sparse_firmware_image(app, device, image, input, sparse, flash_sectors).await;
+    }
+
+    let actual_size = std::fs::metadata(&image.path)
+        .map_err(|e| format!("Read extracted image metadata failed: {e}"))?
+        .len();
+    if actual_size != image.byte_count {
+        return Err(format!(
+            "Extracted image size changed for {}: expected {}, got {}",
+            image.name, image.byte_count, actual_size
+        ));
+    }
+
+    let chunks = write_lba_chunk_plan(image.flash_offset_sectors, actual_size)?;
+    let total_transfer = chunks.iter().map(|chunk| chunk.transfer_len as u64).sum::<u64>();
+    let total_sectors = total_transfer / SECTOR_SIZE as u64;
+    if image.flash_size_sectors > 0 && total_sectors > image.flash_size_sectors {
+        return Err(format!(
+            "Image {} ({total_sectors} sectors) exceeds its firmware partition ({} sectors)",
+            image.name, image.flash_size_sectors
+        ));
+    }
+
+    let end_sector = image
+        .flash_offset_sectors
+        .checked_add(total_sectors)
+        .ok_or_else(|| "Firmware image range overflows".to_string())?;
+    if end_sector > u64::from(flash_sectors) {
+        return Err(format!(
+            "Image {} LBA range 0x{:x}-0x{:x} exceeds flash size 0x{flash_sectors:x}",
+            image.name,
+            image.flash_offset_sectors,
+            end_sector.saturating_sub(1)
+        ));
+    }
+
+    emit_log(
+        app,
+        &format!(
+            "Writing {}: LBA 0x{:08x}-0x{:08x} ({})",
+            image.name,
+            image.flash_offset_sectors,
+            end_sector.saturating_sub(1),
+            format_byte_count(actual_size),
+        ),
+    );
+
+    let mut input = File::open(&image.path).map_err(|e| format!("Open extracted image failed: {e}"))?;
+    let mut written = 0u64;
+    let mut last_progress_percent = None;
+    for chunk in &chunks {
+        let mut data = vec![0u8; chunk.transfer_len];
+        input
+            .read_exact(&mut data[..chunk.source_len])
+            .map_err(|e| format!("Read extracted image failed: {e}"))?;
+        let transferred = device
+            .write_lba(chunk.start_sector, &data)
+            .await
+            .map_err(|e| format!("Write {} at LBA {} failed: {e}", image.name, chunk.start_sector))?;
+        if transferred as usize != chunk.transfer_len {
+            return Err(format!(
+                "Short write for {} at LBA {}: got {transferred} bytes, expected {}",
+                image.name, chunk.start_sector, chunk.transfer_len
+            ));
+        }
+
+        written += chunk.source_len as u64;
+        let percent = (written * 100) / actual_size;
+        if should_emit_progress(last_progress_percent, percent) {
+            emit_progress(
+                app,
+                format!(
+                    "Writing {}... {}/{} ({percent}%)",
+                    image.name,
+                    format_byte_count(written),
+                    format_byte_count(actual_size),
+                ),
+            );
+            last_progress_percent = Some(percent);
+        }
+    }
+
+    Ok(format!("Written {} successfully", image.name))
+}
+
+fn open_android_sparse_image(path: &Path) -> Result<Option<(File, SparseHeader)>, String> {
+    let mut input = File::open(path).map_err(|e| format!("Open extracted image failed: {e}"))?;
+    if input
+        .metadata()
+        .map_err(|e| format!("Read extracted image metadata failed: {e}"))?
+        .len()
+        < 4
+    {
+        return Ok(None);
+    }
+    let mut first_header = [0u8; 28];
+    input
+        .read_exact(&mut first_header[..4])
+        .map_err(|e| format!("Read extracted image failed: {e}"))?;
+    if u32::from_le_bytes(first_header[..4].try_into().unwrap()) != 0xed26_ff3a {
+        return Ok(None);
+    }
+    input
+        .read_exact(&mut first_header[4..])
+        .map_err(|e| format!("Read Android sparse header failed: {e}"))?;
+    let sparse = parse_sparse_header(&first_header)?
+        .ok_or_else(|| "Android sparse signature disappeared while reading header".to_string())?;
+
+    if sparse.file_header_size > first_header.len() {
+        let mut extra_header = vec![0u8; sparse.file_header_size - first_header.len()];
+        input
+            .read_exact(&mut extra_header)
+            .map_err(|e| format!("Read Android sparse header failed: {e}"))?;
+    }
+    Ok(Some((input, sparse)))
+}
+
+async fn write_sparse_firmware_image(
+    app: &AppHandle,
+    device: &mut Device,
+    image: &FirmwareImage,
+    mut input: File,
+    sparse: SparseHeader,
+    flash_sectors: u32,
+) -> Result<String, String> {
+    let output_sectors = sparse.output_bytes / SECTOR_SIZE as u64;
+    let total_sectors = validate_firmware_range(image, output_sectors, flash_sectors)?;
+    let end_sector = image
+        .flash_offset_sectors
+        .checked_add(total_sectors)
+        .ok_or_else(|| "Firmware image range overflows".to_string())?;
+    emit_log(
+        app,
+        &format!(
+            "Writing {} (Android sparse): LBA 0x{:08x}-0x{:08x} ({})",
+            image.name,
+            image.flash_offset_sectors,
+            end_sector.saturating_sub(1),
+            format_byte_count(sparse.output_bytes),
+        ),
+    );
+
+    let mut written = 0u64;
+    let mut last_progress_percent = None;
+    for _ in 0..sparse.total_chunks {
+        let mut chunk_header = vec![0u8; sparse.chunk_header_size];
+        input
+            .read_exact(&mut chunk_header)
+            .map_err(|e| format!("Read Android sparse chunk header failed: {e}"))?;
+        let chunk = parse_sparse_chunk_header(&sparse, &chunk_header)?;
+
+        if sparse_chunk_requires_write(chunk.kind) {
+            match chunk.kind {
+                SparseChunkKind::Raw => {
+                    write_sparse_stream_chunk(device, &mut input, image, written, chunk.output_bytes)
+                        .await?
+                }
+                SparseChunkKind::Fill => {
+                    let mut fill = [0u8; 4];
+                    input
+                        .read_exact(&mut fill)
+                        .map_err(|e| format!("Read Android sparse fill value failed: {e}"))?;
+                    write_sparse_fill_chunk(device, image, written, chunk.output_bytes, &fill)
+                        .await?
+                }
+                SparseChunkKind::DontCare | SparseChunkKind::Crc32 => unreachable!(),
+            }
+        } else if chunk.kind == SparseChunkKind::Crc32 {
+            let mut checksum = [0u8; 4];
+            input
+                .read_exact(&mut checksum)
+                .map_err(|e| format!("Read Android sparse checksum failed: {e}"))?;
+        }
+
+        written = written
+            .checked_add(chunk.output_bytes)
+            .ok_or_else(|| "Android sparse output size overflows".to_string())?;
+        let percent = (written * 100) / sparse.output_bytes;
+        if should_emit_progress(last_progress_percent, percent) {
+            emit_progress(
+                app,
+                format!(
+                    "Writing {}... {}/{} ({percent}%)",
+                    image.name,
+                    format_byte_count(written),
+                    format_byte_count(sparse.output_bytes),
+                ),
+            );
+            last_progress_percent = Some(percent);
+        }
+    }
+
+    if written != sparse.output_bytes {
+        return Err(format!(
+            "Android sparse image {} expands to {written} bytes, expected {}",
+            image.name, sparse.output_bytes
+        ));
+    }
+    Ok(format!("Written {} successfully", image.name))
+}
+
+fn sparse_chunk_requires_write(kind: SparseChunkKind) -> bool {
+    matches!(kind, SparseChunkKind::Raw | SparseChunkKind::Fill)
+}
+
+async fn write_sparse_stream_chunk(
+    device: &mut Device,
+    input: &mut File,
+    image: &FirmwareImage,
+    output_offset: u64,
+    byte_count: u64,
+) -> Result<(), String> {
+    let mut remaining = byte_count;
+    let mut offset = output_offset;
+    while remaining > 0 {
+        let count = remaining.min(WRITE_LBA_CHUNK as u64) as usize;
+        let mut data = vec![0u8; count];
+        input
+            .read_exact(&mut data)
+            .map_err(|e| format!("Read Android sparse payload failed: {e}"))?;
+        write_sparse_lba_chunk(device, image, offset, &data).await?;
+        remaining -= count as u64;
+        offset += count as u64;
+    }
+    Ok(())
+}
+
+async fn write_sparse_fill_chunk(
+    device: &mut Device,
+    image: &FirmwareImage,
+    output_offset: u64,
+    byte_count: u64,
+    fill: &[u8; 4],
+) -> Result<(), String> {
+    let mut remaining = byte_count;
+    let mut offset = output_offset;
+    let mut data = vec![0u8; WRITE_LBA_CHUNK];
+    for pattern in data.chunks_exact_mut(fill.len()) {
+        pattern.copy_from_slice(fill);
+    }
+    while remaining > 0 {
+        let count = remaining.min(data.len() as u64) as usize;
+        write_sparse_lba_chunk(device, image, offset, &data[..count]).await?;
+        remaining -= count as u64;
+        offset += count as u64;
+    }
+    Ok(())
+}
+
+async fn write_sparse_lba_chunk(
+    device: &mut Device,
+    image: &FirmwareImage,
+    output_offset: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    let sector_offset = output_offset / SECTOR_SIZE as u64;
+    let start_sector = image
+        .flash_offset_sectors
+        .checked_add(sector_offset)
+        .and_then(|sector| u32::try_from(sector).ok())
+        .ok_or_else(|| "Android sparse LBA address overflows".to_string())?;
+    let transferred = device
+        .write_lba(start_sector, data)
+        .await
+        .map_err(|e| format!("Write {} at LBA {start_sector} failed: {e}", image.name))?;
+    if transferred as usize != data.len() {
+        return Err(format!(
+            "Short write for {} at LBA {start_sector}: got {transferred} bytes, expected {}",
+            image.name,
+            data.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_firmware_range(
+    image: &FirmwareImage,
+    total_sectors: u64,
+    flash_sectors: u32,
+) -> Result<u64, String> {
+    if image.flash_size_sectors > 0 && total_sectors > image.flash_size_sectors {
+        return Err(format!(
+            "Image {} ({total_sectors} sectors) exceeds its firmware partition ({} sectors)",
+            image.name, image.flash_size_sectors
+        ));
+    }
+    let end_sector = image
+        .flash_offset_sectors
+        .checked_add(total_sectors)
+        .ok_or_else(|| "Firmware image range overflows".to_string())?;
+    if end_sector > u64::from(flash_sectors) {
+        return Err(format!(
+            "Image {} LBA range 0x{:x}-0x{:x} exceeds flash size 0x{flash_sectors:x}",
+            image.name,
+            image.flash_offset_sectors,
+            end_sector.saturating_sub(1)
+        ));
+    }
+    Ok(total_sectors)
+}
+
+fn gpt_tables_for_firmware(
+    images: &[FirmwareImage],
+    flash_sectors: u32,
+) -> Result<Option<GptTables>, String> {
+    let Some(parameter) = images.iter().find(|image| is_parameter_image(image)) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(&parameter.path)
+        .map_err(|e| format!("Read parameter image failed: {e}"))?;
+    let Some(partitions) = parse_gpt_parameter(&bytes)? else {
+        return Ok(None);
+    };
+    Ok(Some(build_gpt_tables(&partitions, flash_sectors)?))
+}
+
+fn is_parameter_image(image: &FirmwareImage) -> bool {
+    image.name.eq_ignore_ascii_case("parameter")
+        || image
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("parameter.txt"))
+}
+
+async fn write_gpt_tables(
+    app: &AppHandle,
+    device: &mut Device,
+    tables: &GptTables,
+) -> Result<(), String> {
+    emit_log(app, "Writing GPT partition table");
+    write_gpt_bytes(device, 0, &tables.primary).await?;
+    write_gpt_bytes(device, tables.backup_start_sector, &tables.backup).await?;
+    emit_log(app, "Written GPT partition table successfully");
+    Ok(())
+}
+
+async fn write_gpt_bytes(device: &mut Device, start_sector: u32, data: &[u8]) -> Result<(), String> {
+    for (index, chunk) in data.chunks(WRITE_LBA_CHUNK).enumerate() {
+        let sector_offset = u32::try_from(index * (WRITE_LBA_CHUNK / SECTOR_SIZE))
+            .map_err(|_| "GPT LBA address overflows".to_string())?;
+        let sector = start_sector
+            .checked_add(sector_offset)
+            .ok_or_else(|| "GPT LBA address overflows".to_string())?;
+        let transferred = device
+            .write_lba(sector, chunk)
+            .await
+            .map_err(|e| format!("Write GPT at LBA {sector} failed: {e}"))?;
+        if transferred as usize != chunk.len() {
+            return Err(format!(
+                "Short GPT write at LBA {sector}: got {transferred} bytes, expected {}",
+                chunk.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_upgrade_temp_dir() -> Result<PathBuf, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("rkdevtool-upgrade-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&path).map_err(|e| format!("Create upgrade temp directory failed: {e}"))?;
+    Ok(path)
+}
+
+async fn wait_for_loader_device(state: &AppState) -> Result<Device, String> {
+    let mut last_status = String::from("Loader is still starting");
+    for _ in 0..LOADER_READY_RETRIES {
+        match open_selected_device(state).await {
+            Ok(mut device) => {
+                let probe = device
+                    .flash_info()
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("Flash is not ready: {err}"));
+                if !loader_flash_probe_needs_retry(&probe) {
+                    return Ok(device);
+                }
+                last_status = probe.unwrap_err();
+            }
+            Err(err) => last_status = err,
+        }
+        thread::sleep(LOADER_READY_INTERVAL);
+    }
+    Err(format!(
+        "Loader did not become ready after Boot download; re-enter Maskrom and retry ({last_status})"
+    ))
+}
+
+fn loader_flash_probe_needs_retry(probe: &Result<(), String>) -> bool {
+    probe.is_err()
+}
+
+/// Extract a firmware package, download its Loader in Maskrom, then write every package entry via RockUSB LBA.
+#[tauri::command]
+pub async fn upgrade_firmware(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    no_reset: Option<bool>,
+) -> Result<(), String> {
+    devices::ensure_backend_not_busy(state.inner())?;
+    devices::set_backend_busy(state.inner(), true)?;
+
+    let temp_dir = match create_upgrade_temp_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = devices::set_backend_busy(state.inner(), false);
+            return Err(err);
+        }
+    };
+    let result = async {
+        emit_log(&app, &format!("> rockusb upgrade {path}"));
+        emit_log(&app, &format!("Extracting firmware to {}", temp_dir.display()));
+        let extract_path = path.clone();
+        let extract_dir = temp_dir.clone();
+        let firmware = tauri::async_runtime::spawn_blocking(move || {
+            extract_firmware_for_upgrade(&extract_path, &extract_dir.display().to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        emit_lines(&app, &firmware.log);
+
+        let mut device = if selected_device_is_maskrom(state.inner()).await? {
+            let loader_path = firmware.loader_path.as_ref().ok_or_else(|| {
+                "Firmware has no download.bin or MiniLoaderAll.bin for Maskrom Boot download".to_string()
+            })?;
+            emit_log(&app, &format!("Downloading Loader: {}", loader_path.display()));
+            let mut maskrom_device = open_selected_device(state.inner()).await?;
+            let loader_log = download_boot_to_device(&mut maskrom_device, loader_path).await?;
+            emit_lines(&app, &loader_log);
+            drop(maskrom_device);
+            wait_for_loader_device(state.inner()).await?
+        } else {
+            open_selected_device(state.inner()).await?
+        };
+
+        let flash_sectors = device
+            .flash_info()
+            .await
+            .map_err(|e| format!("Read Flash info failed after Loader download: {e}"))?
+            .sectors();
+        if flash_sectors == 0 {
+            return Err("Flash reports 0 sectors".to_string());
+        }
+
+        let gpt_tables = gpt_tables_for_firmware(&firmware.images, flash_sectors)?;
+        let has_gpt_parameter = gpt_tables.is_some();
+        if let Some(tables) = gpt_tables.as_ref() {
+            write_gpt_tables(&app, &mut device, tables).await?;
+        }
+
+        for image in &firmware.images {
+            if has_gpt_parameter && is_parameter_image(image) {
+                continue;
+            }
+            let line = write_firmware_image(&app, &mut device, image, flash_sectors).await?;
+            emit_log(&app, &line);
+        }
+
+        if !no_reset.unwrap_or(false) {
+            device
+                .reset_device(ResetOpcode::Reset)
+                .await
+                .map_err(|e| format!("Reset device after upgrade failed: {e}"))?;
+            emit_log(&app, "Reset Device Success");
+        }
+        emit_log(&app, "Firmware upgrade succeeded");
+        Ok(())
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = devices::set_backend_busy(state.inner(), false);
+    result
+}
+
+/// Download Boot / Loader into Maskrom.
 #[tauri::command]
 pub async fn download_boot(
     app: AppHandle,
@@ -433,21 +1045,7 @@ pub async fn download_boot(
     }
 
     with_busy_device(&app, &state, &format!("download-boot {path}"), move |mut device| async move {
-        let mut file =
-            File::open(&boot_path).map_err(|e| format!("Open boot file failed: {e}"))?;
-        let mut header_bytes: RkBootHeaderBytes = [0; 102];
-        file.read_exact(&mut header_bytes)
-            .map_err(|e| format!("Read boot header failed: {e}"))?;
-        let header = RkBootHeader::from_bytes(&header_bytes)
-            .ok_or_else(|| {
-                "Failed to parse Loader/Boot header (use MiniLoaderAll.bin or download.bin)"
-                    .to_string()
-            })?;
-
-        let mut log = String::from("Download Boot Start\n");
-        download_boot_entry(&mut device, header.entry_471, 0x471, &mut file, &mut log).await?;
-        download_boot_entry(&mut device, header.entry_472, 0x472, &mut file, &mut log).await?;
-        log.push_str("Download Boot Success");
+        let log = download_boot_to_device(&mut device, &boot_path).await?;
         Ok(((), log))
     })
     .await
@@ -833,6 +1431,70 @@ pub async fn try_run_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firmware_progress_emits_only_when_the_percent_changes() {
+        assert!(should_emit_progress(None, 0));
+        assert!(!should_emit_progress(Some(75), 75));
+        assert!(should_emit_progress(Some(75), 76));
+        assert!(should_emit_progress(Some(99), 100));
+    }
+
+    #[test]
+    fn android_sparse_dont_care_chunks_do_not_transfer_data() {
+        assert!(sparse_chunk_requires_write(SparseChunkKind::Raw));
+        assert!(sparse_chunk_requires_write(SparseChunkKind::Fill));
+        assert!(!sparse_chunk_requires_write(SparseChunkKind::DontCare));
+    }
+
+    #[test]
+    fn byte_count_below_one_kib_uses_bytes() {
+        assert_eq!(format_byte_count(512), "512 B");
+    }
+
+    #[test]
+    fn byte_count_at_one_kib_uses_kib() {
+        assert_eq!(format_byte_count(1024), "1 KiB");
+    }
+
+    #[test]
+    fn byte_count_in_mebibytes_uses_two_decimal_places() {
+        assert_eq!(format_byte_count(3_223_040), "3.07 MiB");
+    }
+
+    #[test]
+    fn byte_count_at_one_gib_uses_gib() {
+        assert_eq!(format_byte_count(1024 * 1024 * 1024), "1 GiB");
+    }
+
+    #[test]
+    fn write_plan_pads_the_final_sector_and_limits_chunks() {
+        let chunks = write_lba_chunk_plan(0x20, 128 * 512 + 1).unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                LbaWriteChunk {
+                    start_sector: 0x20,
+                    source_len: 128 * 512,
+                    transfer_len: 128 * 512,
+                },
+                LbaWriteChunk {
+                    start_sector: 0x20 + 128,
+                    source_len: 1,
+                    transfer_len: 512,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn loader_flash_probe_retries_until_the_device_is_ready() {
+        assert!(loader_flash_probe_needs_retry(&Err(
+            "No Rockchip device found (enter Maskrom/Loader)".to_string()
+        )));
+        assert!(!loader_flash_probe_needs_retry(&Ok(())));
+    }
 
     #[test]
     fn ui_storage_roundtrip_common() {

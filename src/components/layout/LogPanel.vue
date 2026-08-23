@@ -102,7 +102,7 @@ function handleClear() {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
-  overflow-x: hidden;
+  overflow-x: scroll;
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -134,14 +134,17 @@ function handleClear() {
   font-size: 12px;
   line-height: 18px;
   color: var(--color-log-text);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
   flex-shrink: 0;
 }
 
 .log-line--progress {
   color: #fbbf24;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
 }
 
 .log-line--success {

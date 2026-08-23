@@ -23,7 +23,7 @@ A modern alternative to the official Windows-only RKDevTool. Wraps `upgrade_tool
 | Page | Description |
 |------|-------------|
 | **Download Image** | Flash Loader and partition images from a partition table; optional write-by-address |
-| **Upgrade Firmware** | Full-package upgrade with `update.img` (UF command) |
+| **Upgrade Firmware** | Extract an `update.img`, download its Loader, then write each partition through RockUSB |
 | **Advanced** | Download Boot, extract firmware, read chip info, erase, reboot, switch storage, and more |
 
 - Auto-poll RockUSB devices; status bar shows Maskrom / Loader mode
@@ -142,7 +142,7 @@ macOS signing & notarization secrets:
 | 页面 | 说明 |
 |------|------|
 | **下载镜像** | 按分区表烧录 Loader / 各分区镜像，支持按地址写入 |
-| **升级固件** | 使用 `update.img` 整包升级（UF） |
+| **升级固件** | 解包 `update.img`，下载 Loader 后通过 RockUSB 写入各分区 |
 | **高级功能** | 下载 Boot、解包固件、读取芯片信息，以及擦除、重启、切换存储等操作 |
 
 - 自动轮询 RockUSB 设备，状态栏显示当前连接模式（Maskrom / Loader）
