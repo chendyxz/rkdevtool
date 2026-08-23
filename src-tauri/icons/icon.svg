@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title>RKDevTool</title>
+  <rect width="512" height="512" rx="112" fill="#0F172A"/>
+  <rect x="112" y="112" width="288" height="288" rx="68" fill="#2D63EA"/>
+  <rect x="50" y="166" width="118" height="36" rx="18" fill="#2CC6DF"/>
+  <rect x="50" y="238" width="118" height="36" rx="18" fill="#2CC6DF"/>
+  <rect x="50" y="310" width="118" height="36" rx="18" fill="#2CC6DF"/>
+  <rect x="344" y="166" width="118" height="36" rx="18" fill="#F7A20B"/>
+  <rect x="344" y="238" width="118" height="36" rx="18" fill="#F7A20B"/>
+  <rect x="344" y="310" width="118" height="36" rx="18" fill="#F7A20B"/>
+  <path fill="#FFFFFF" d="M166 180h54c43 0 70 23 70 61 0 25-12 44-32 54l38 65h-42l-32-57h-18v57h-38V180Zm38 34v56h15c20 0 32-10 32-28 0-17-12-28-32-28h-15Zm104-34h38v70l58-70h45l-65 78 69 102h-46l-49-74-12 14v60h-38V180Z"/>
+  <circle cx="356" cy="356" r="14" fill="#2CC6DF"/>
+</svg>
