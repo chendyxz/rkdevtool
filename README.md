@@ -1,34 +1,56 @@
 # RKDevTool
 
-Cross-platform desktop GUI for Rockchip USB flashing, built with [Tauri 2](https://v2.tauri.app/) + Vue 3.
+Cross-platform Rockchip USB flashing GUI built with [Tauri 2](https://v2.tauri.app/) + Vue 3. The project is actively moving toward a pure Rust/RockUSB implementation.
 
-瑞芯微 USB 烧录工具的跨平台桌面 GUI，基于 Tauri 2 + Vue 3，封装官方命令行工具 `upgrade_tool`。
+瑞芯微 USB 烧录工具的跨平台桌面 GUI，基于 Tauri 2 + Vue 3。项目正在积极迁移至纯 Rust/RockUSB 实现。
 
 **[English](#english)** · **[中文](#中文)**
 
 ## Screenshots
 
-![DshanPi (泰山派)](./docs/images/泰山派.png)
+### Download Image / 下载镜像
 
-![Luckfox Pro Max](./docs/images/Luckfox-Pro-Max.png)
+![Download Image](./docs/images/download-image.jpg)
+
+### Upgrade Firmware / 升级固件
+
+![Upgrade Firmware](./docs/images/upgrade-firmware.jpg)
+
+### Advanced / 高级功能
+
+![Advanced](./docs/images/advanced.jpg)
 
 ---
 
 ## English
 
-A modern alternative to the official Windows-only RKDevTool. Wraps `upgrade_tool` with real-time logs, device polling, and native builds for macOS, Windows, and Linux.
+A modern alternative to the official Windows-only RKDevTool, with real-time logs, device polling, and native builds for macOS, Windows, and Linux. Core flashing workflows are implemented directly in Rust through RockUSB.
 
 ### Features
 
 | Page | Description |
 |------|-------------|
-| **Download Image** | Flash Loader and partition images from a partition table; optional write-by-address |
-| **Upgrade Firmware** | Extract an `update.img`, download its Loader, then write each partition through RockUSB |
-| **Advanced** | Download Boot, extract firmware, read chip info, erase, reboot, switch storage, and more |
+| **Download Image** | Flash Loader and partition images through RockUSB; supports partition-table and write-by-address modes |
+| **Upgrade Firmware** | Extract an `update.img` to a temporary directory, download its Loader, then write each partition through RockUSB |
+| **Advanced** | Download Boot, extract firmware, read chip/Flash/Capability info, erase, reboot, switch storage, export images, and more |
 
 - Auto-poll RockUSB devices; status bar shows Maskrom / Loader mode
 - Live log panel with in-place progress updates (`Download Image... (xx%)`)
 - Switch target device from the status bar when multiple devices are connected
+
+### Rust / RockUSB migration status
+
+Most day-to-day operations now use the Rust RockUSB backend directly: device discovery, Loader/Boot download, Download Image, firmware unpacking and partition flashing, Flash/Chip/Capability reads, device testing and reset, Maskrom entry, storage switching, erase, and image export.
+
+Only a small compatibility surface still launches the official `upgrade_tool`:
+
+- Read the device partition list (`PL`)
+- Clear serial number (`SN`)
+- Detect secure mode (`RSM`)
+- Export serial log (`RCL`)
+- Switch USB3 (`SSD`)
+
+The bundled binary is still checked at startup and remains required for these compatibility features. It will be removed from the normal flashing path as the remaining commands are implemented in Rust.
 
 ### Download
 
@@ -58,7 +80,7 @@ sudo apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev pat
 
 **USB permissions (flashing without sudo)**
 
-On Linux, `upgrade_tool` needs read/write access to Rockchip USB devices (vendor ID `2207`). Without udev rules you may see errors such as `Creating Comm Object failed!` and must run with `sudo`.
+On Linux, RKDevTool needs read/write access to Rockchip USB devices (vendor ID `2207`). Without udev rules you may see USB access errors and must run with `sudo`.
 
 | Install method | udev setup |
 |----------------|------------|
@@ -77,9 +99,9 @@ sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=us
 
 Unplug/replug the device (or re-enter Maskrom), then launch RKDevTool as a normal user. Do **not** run the GUI with `sudo` unless necessary.
 
-**`upgrade_tool` binaries**
+**`upgrade_tool` compatibility binaries**
 
-Place Rockchip SDK `upgrade_tool` files under:
+The application still bundles Rockchip SDK `upgrade_tool` files for the small set of compatibility commands listed above. Place them under:
 
 ```
 src-tauri/bin/
@@ -88,7 +110,7 @@ src-tauri/bin/
 └── windows_x86-64/
 ```
 
-Use **v2.44+** when possible. The bundled Mac tool (v2.13) has incomplete support for newer chips (e.g. RK3576); copy a newer binary from the Linux/Windows SDK if needed.
+Use **v2.44+** when possible. The bundled Mac tool (v2.13) has incomplete support for newer chips (e.g. RK3576); use a newer SDK binary when the remaining compatibility commands require it.
 
 **Run locally**
 
@@ -128,26 +150,40 @@ macOS signing & notarization secrets:
 ### Tech stack
 
 - **Frontend**: Vue 3 + TypeScript + Vite
-- **Backend**: Rust (Tauri 2 commands, `upgrade_tool` subprocess)
+- **Backend**: Rust (Tauri 2 commands, `rockusb` protocol implementation, limited `upgrade_tool` compatibility subprocesses)
 - **Design**: Penpot specs in `design/`
 
 ---
 
 ## 中文
 
-相比官方仅支持 Windows 的工具，RKDevTool 提供 macOS / Linux 原生版本，实时日志输出与现代界面。
+相比官方仅支持 Windows 的工具，RKDevTool 提供 macOS / Linux 原生版本、实时日志输出与现代界面。核心烧录流程已直接通过 Rust/RockUSB 实现。
 
 ### 功能
 
 | 页面 | 说明 |
 |------|------|
-| **下载镜像** | 按分区表烧录 Loader / 各分区镜像，支持按地址写入 |
-| **升级固件** | 解包 `update.img`，下载 Loader 后通过 RockUSB 写入各分区 |
-| **高级功能** | 下载 Boot、解包固件、读取芯片信息，以及擦除、重启、切换存储等操作 |
+| **下载镜像** | 通过 RockUSB 按分区表烧录 Loader / 各分区镜像，支持按地址写入 |
+| **升级固件** | 将 `update.img` 解包到临时目录，下载 Loader 后通过 RockUSB 写入各分区 |
+| **高级功能** | 下载 Boot、解包固件、读取芯片/Flash/Capability 信息，以及擦除、重启、切换存储、导出镜像等操作 |
 
 - 自动轮询 RockUSB 设备，状态栏显示当前连接模式（Maskrom / Loader）
 - 实时日志面板，进度行原地刷新（`Download Image... (xx%)`）
 - 多设备时可在状态栏切换目标设备
+
+### Rust / RockUSB 迁移进度
+
+目前绝大多数日常操作已由 Rust RockUSB 后端直接完成：设备发现、Loader / Boot 下载、下载镜像、固件解包与分区写入、Flash / 芯片 / Capability 信息读取、设备测试与重启、进入 Maskrom、切换存储、擦除和导出镜像。
+
+当前仅有少量兼容功能仍会调用官方 `upgrade_tool`：
+
+- 读取设备分区表（`PL`）
+- 清空序列号（`SN`）
+- 检测安全模式（`RSM`）
+- 导出串口日志（`RCL`）
+- 切换 USB3（`SSD`）
+
+应用启动时仍会检查内置二进制，且上述兼容功能仍需要它。随着剩余命令被逐步实现为 Rust，正常刷机流程对官方工具的依赖将继续缩小。
 
 ### 下载
 
@@ -177,7 +213,7 @@ sudo apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev pat
 
 **USB 权限（免 sudo 刷机）**
 
-Linux 下 `upgrade_tool` 需要访问瑞芯微 USB 设备（厂商 ID `2207`）。未配置 udev 时可能出现 `Creating Comm Object failed!` 等错误，只能使用 `sudo` 刷机。
+Linux 下 RKDevTool 需要访问瑞芯微 USB 设备（厂商 ID `2207`）。未配置 udev 时可能出现 USB 访问错误，只能使用 `sudo` 刷机。
 
 | 安装方式 | udev 配置 |
 |----------|-----------|
@@ -196,9 +232,9 @@ sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=us
 
 重新插拔设备或重新进入 Maskrom 后，以普通用户启动 RKDevTool 即可。除非必要，**不要用 `sudo` 运行图形界面**。
 
-**`upgrade_tool` 二进制**
+**`upgrade_tool` 兼容二进制**
 
-开发/打包前，将瑞芯微 SDK 中的 `upgrade_tool` 放入对应目录：
+应用仍会为上述少量兼容命令打包瑞芯微 SDK 中的 `upgrade_tool`，请将其放入对应目录：
 
 ```
 src-tauri/bin/
@@ -207,7 +243,7 @@ src-tauri/bin/
 └── windows_x86-64/
 ```
 
-建议使用 **v2.44+** 版本。Mac 自带旧版（v2.13）对部分新芯片（如 RK3576）支持不完整，可从 Linux/Windows SDK 包中获取较新版本替换。
+建议使用 **v2.44+** 版本。Mac 自带旧版（v2.13）对部分新芯片（如 RK3576）支持不完整；需要使用剩余兼容功能时，可从 Linux/Windows SDK 包中获取较新版本替换。
 
 **本地运行**
 
@@ -247,7 +283,7 @@ macOS 签名与公证需在仓库 Secrets 中配置：
 ### 技术栈
 
 - **前端**：Vue 3 + TypeScript + Vite
-- **后端**：Rust（Tauri 2 命令，封装 `upgrade_tool` 子进程）
+- **后端**：Rust（Tauri 2 命令、`rockusb` 协议实现，以及少量 `upgrade_tool` 兼容子进程）
 - **设计**：Penpot 设计稿，见 `design/`
 
 ---
