@@ -1218,35 +1218,35 @@ pub async fn download_execute(
 
 fn action_label_en(action: &str) -> &'static str {
     match action {
-        "读取FlashID" => "Read Flash ID",
-        "读取Flash信息" => "Read Flash info",
-        "读取Chip信息" => "Read chip info",
-        "读取Capability" => "Read capability",
-        "测试设备" => "Test device",
-        "重启设备" => "Reboot device",
-        "进入Maskrom" => "Enter Maskrom",
-        "切换存储" => "Switch storage",
-        "获取当前存储" => "Get current storage",
-        "清空序列号" => "Clear serial",
-        "检测安全模式" => "Detect secure mode",
-        "导出串口日志" => "Export serial log",
-        "擦除扇区" => "Erase sector",
-        "擦除所有" => "Erase all",
-        "切换USB3" => "Switch USB3",
+        "read-flash-id" => "Read Flash ID",
+        "read-flash-info" => "Read Flash info",
+        "read-chip-info" => "Read chip info",
+        "read-capability" => "Read capability",
+        "test-device" => "Test device",
+        "reboot-device" => "Reboot device",
+        "enter-maskrom" => "Enter Maskrom",
+        "switch-storage" => "Switch storage",
+        "get-current-storage" => "Get current storage",
+        "clear-serial" => "Clear serial",
+        "detect-secure-mode" => "Detect secure mode",
+        "export-serial-log" => "Export serial log",
+        "erase-sector" => "Erase sector",
+        "erase-all" => "Erase all",
+        "switch-usb3" => "Switch USB3",
         _ => "Action",
     }
 }
 
 fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, String> {
     Ok(match action {
-        "读取FlashID" => vec!["RID".into()],
-        "读取Flash信息" => vec!["RFI".into()],
-        "读取Chip信息" => vec!["RCI".into()],
-        "读取Capability" => vec!["RCB".into()],
-        "测试设备" => vec!["TD".into()],
-        "重启设备" => vec!["RD".into()],
-        "进入Maskrom" => vec!["RD".into(), "3".into()],
-        "切换存储" => {
+        "read-flash-id" => vec!["RID".into()],
+        "read-flash-info" => vec!["RFI".into()],
+        "read-chip-info" => vec!["RCI".into()],
+        "read-capability" => vec!["RCB".into()],
+        "test-device" => vec!["TD".into()],
+        "reboot-device" => vec!["RD".into()],
+        "enter-maskrom" => vec!["RD".into(), "3".into()],
+        "switch-storage" => {
             let index = params
                 .start_sector
                 .clone()
@@ -1254,9 +1254,9 @@ fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, St
                 .unwrap_or_else(|| "1".into());
             vec!["SSD".into(), index]
         }
-        "清空序列号" => vec!["SN".into(), String::new()],
-        "检测安全模式" => vec!["RSM".into()],
-        "导出串口日志" => {
+        "clear-serial" => vec!["SN".into(), String::new()],
+        "detect-secure-mode" => vec!["RSM".into()],
+        "export-serial-log" => {
             let path = params
                 .output_path
                 .clone()
@@ -1264,12 +1264,12 @@ fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, St
                 .unwrap_or_else(|| "serial.log".into());
             vec!["RCL".into(), path]
         }
-        "擦除扇区" => {
+        "erase-sector" => {
             let start = params.start_sector.clone().unwrap_or_else(|| "0".into());
             let count = params.sector_count.clone().unwrap_or_else(|| "1".into());
             vec!["EL".into(), start, count]
         }
-        "擦除所有" => {
+        "erase-all" => {
             let loader = params
                 .boot_path
                 .clone()
@@ -1277,7 +1277,7 @@ fn action_to_args(action: &str, params: &ActionParams) -> Result<Vec<String>, St
                 .ok_or("Erase all requires a Boot/Loader path")?;
             vec!["EF".into(), loader]
         }
-        "切换USB3" => vec!["SSD".into()],
+        "switch-usb3" => vec!["SSD".into()],
         _ => return Err(format!("Unsupported action: {}", action_label_en(action))),
     })
 }

@@ -47,10 +47,10 @@ async function browseFile(target: "boot" | "firmware") {
 }
 
 function actionParams(command: string) {
-  if (command === "切换存储") {
+  if (command === "switch-storage") {
     return { start_sector: String(selectedStorage.value + 1) };
   }
-  if (command === "擦除扇区") {
+  if (command === "erase-sector") {
     return {
       start_sector: startSector.value || "0",
       sector_count: sectorCount.value || "1",
@@ -72,7 +72,7 @@ async function exportSerialLog(labelKey: string) {
 
   try {
     await run(
-      () => toolApi.runAction("导出串口日志", { output_path: outputPath }),
+      () => toolApi.runAction("export-serial-log", { output_path: outputPath }),
       logText(labelKey),
     );
   } catch (err) {
@@ -91,7 +91,7 @@ async function exportImage(labelKey: string) {
   try {
     await run(
       () =>
-        toolApi.runAction("导出镜像", {
+        toolApi.runAction("export-image", {
           start_sector: startSector.value || "0",
           sector_count: sectorCount.value.trim() || undefined,
           output_path: outputPath,
@@ -129,17 +129,17 @@ async function getCurrentStorageAction(labelKey: string) {
 }
 
 async function runAction(command: string, labelKey: string) {
-  if (command === "导出镜像") {
+  if (command === "export-image") {
     await exportImage(labelKey);
     return;
   }
 
-  if (command === "导出串口日志") {
+  if (command === "export-serial-log") {
     await exportSerialLog(labelKey);
     return;
   }
 
-  if (command === "获取当前存储") {
+  if (command === "get-current-storage") {
     await getCurrentStorageAction(labelKey);
     return;
   }

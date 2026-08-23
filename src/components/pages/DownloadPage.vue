@@ -114,7 +114,7 @@ async function switchStorage() {
 
   try {
     await run(
-      () => toolApi.runAction("切换存储", { start_sector: index }),
+      () => toolApi.runAction("switch-storage", { start_sector: index }),
       logText("task.switchStorage"),
     );
   } catch (err) {

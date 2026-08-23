@@ -778,14 +778,14 @@ pub async fn try_run_action(
     output_path: Option<&str>,
 ) -> Result<Option<String>, String> {
     match action {
-        "读取FlashID" => Ok(Some(read_flash_id(app, state).await?)),
-        "读取Flash信息" => Ok(Some(read_flash_info(app, state).await?)),
-        "读取Chip信息" => Ok(Some(read_chip_info(app, state).await?)),
-        "读取Capability" => Ok(Some(read_capability(app, state).await?)),
-        "测试设备" => Ok(Some(test_device(app, state).await?)),
-        "重启设备" => Ok(Some(reset_device(app, state, ResetOpcode::Reset).await?)),
-        "进入Maskrom" => Ok(Some(reset_device(app, state, ResetOpcode::Maskrom).await?)),
-        "切换存储" => {
+        "read-flash-id" => Ok(Some(read_flash_id(app, state).await?)),
+        "read-flash-info" => Ok(Some(read_flash_info(app, state).await?)),
+        "read-chip-info" => Ok(Some(read_chip_info(app, state).await?)),
+        "read-capability" => Ok(Some(read_capability(app, state).await?)),
+        "test-device" => Ok(Some(test_device(app, state).await?)),
+        "reboot-device" => Ok(Some(reset_device(app, state, ResetOpcode::Reset).await?)),
+        "enter-maskrom" => Ok(Some(reset_device(app, state, ResetOpcode::Maskrom).await?)),
+        "switch-storage" => {
             let no: u32 = start_sector
                 .filter(|s| !s.is_empty())
                 .unwrap_or("1")
@@ -793,7 +793,7 @@ pub async fn try_run_action(
                 .map_err(|_| "Invalid storage index".to_string())?;
             Ok(Some(switch_storage(app, state, no).await?))
         }
-        "擦除扇区" => {
+        "erase-sector" => {
             let start: u32 = start_sector
                 .filter(|s| !s.is_empty())
                 .unwrap_or("0")
@@ -806,8 +806,8 @@ pub async fn try_run_action(
                 .map_err(|_| "Invalid sector count".to_string())?;
             Ok(Some(erase_sectors(app, state, start, count).await?))
         }
-        "擦除所有" => Ok(Some(erase_all(app, state).await?)),
-        "导出镜像" => {
+        "erase-all" => Ok(Some(erase_all(app, state).await?)),
+        "export-image" => {
             let start: u32 = start_sector
                 .filter(|s| !s.is_empty())
                 .unwrap_or("0")
