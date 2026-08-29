@@ -216,7 +216,7 @@ macOS signing & notarization secrets:
 **Windows Rockusb 驱动**
 
 Windows 下必须安装瑞芯微官方 `Rockusb` 驱动，设备发现和烧录功能才能正常工作。
-请使用瑞芯微 DriverAssistant 或官方 RKDevTool 软件包安装驱动，然后重新插拔设备，
+请使用瑞芯微 DriverAssistant 软件包安装驱动，然后重新插拔设备，
 或重新进入 Maskrom 模式。在设备管理器中，应确认设备已绑定 Rockchip Rockusb 驱动，
 而不是未知设备、ADB 驱动或通用 WinUSB 驱动。RKDevTool 不会自动安装或内置该驱动。
 
