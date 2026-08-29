@@ -304,20 +304,37 @@ async fn open_selected_device(state: &AppState) -> Result<Device, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn selected_driver_device(state: &AppState) -> Result<rockusb::windows::DeviceInfo, String> {
+fn selected_driver_device_with_mode(
+    state: &AppState,
+    required_mode: Option<rockusb::windows::DeviceMode>,
+) -> Result<rockusb::windows::DeviceInfo, String> {
     let selected = state
         .selected_device
         .lock()
         .map_err(|e| e.to_string())?
         .clone();
-    let infos = rockusb::windows::devices()
+    let mut infos = rockusb::windows::devices()
         .map_err(|e| format!("Failed to list installed Rockusb driver interfaces: {e}"))?;
 
+    if let Some(mode) = required_mode {
+        infos.retain(|info| info.mode == mode);
+    }
+
     if infos.is_empty() {
-        return Err(
-            "No Rockchip device with the official Rockusb driver found (enter Maskrom/Loader)"
-                .to_string(),
-        );
+        return Err(match required_mode {
+            Some(rockusb::windows::DeviceMode::Loader) => {
+                "No Rockchip device in Loader mode with the official Rockusb driver found"
+                    .to_string()
+            }
+            Some(rockusb::windows::DeviceMode::Maskrom) => {
+                "No Rockchip device in Maskrom mode with the official Rockusb driver found"
+                    .to_string()
+            }
+            None => {
+                "No Rockchip device with the official Rockusb driver found (enter Maskrom/Loader)"
+                    .to_string()
+            }
+        });
     }
 
     let info = match selected.as_deref().filter(|path| !path.is_empty()) {
@@ -341,10 +358,27 @@ fn selected_driver_device(state: &AppState) -> Result<rockusb::windows::DeviceIn
 }
 
 #[cfg(target_os = "windows")]
+fn selected_driver_device(state: &AppState) -> Result<rockusb::windows::DeviceInfo, String> {
+    selected_driver_device_with_mode(state, None)
+}
+
+#[cfg(target_os = "windows")]
 async fn open_selected_device(state: &AppState) -> Result<Device, String> {
     let info = selected_driver_device(state)?;
     Device::from_interface_path(&info.interface_path)
         .map_err(|e| format!("Failed to open installed Rockusb driver: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+async fn open_loader_device(state: &AppState) -> Result<Device, String> {
+    let info = selected_driver_device_with_mode(state, Some(rockusb::windows::DeviceMode::Loader))?;
+    Device::from_interface_path(&info.interface_path)
+        .map_err(|e| format!("Failed to open installed Rockusb Loader driver: {e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn open_loader_device(state: &AppState) -> Result<Device, String> {
+    open_selected_device(state).await
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1189,7 +1223,10 @@ fn download_requires_reset(has_images: bool) -> bool {
     has_images
 }
 
-async fn wait_for_loader_device(app: &AppHandle, state: &AppState) -> Result<Device, String> {
+async fn wait_for_loader_device(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(Device, FlashInfo), String> {
     let mut last_status = String::from("Loader is still starting");
     for attempt in 0..LOADER_READY_RETRIES {
         emit_progress(
@@ -1199,17 +1236,16 @@ async fn wait_for_loader_device(app: &AppHandle, state: &AppState) -> Result<Dev
                 loader_ready_progress_percent(attempt)
             ),
         );
-        match open_selected_device(state).await {
+        match open_loader_device(state).await {
             Ok(mut device) => {
                 let probe = device
                     .flash_info()
                     .await
-                    .map(|_| ())
                     .map_err(|err| format!("Flash is not ready: {err}"));
                 if !loader_flash_probe_needs_retry(&probe) {
                     emit_progress(app, "Waiting for Loader... (100%)".to_string());
                     emit_log(app, "Loader is ready");
-                    return Ok(device);
+                    return Ok((device, probe.expect("successful Loader flash probe")));
                 }
                 last_status = probe.unwrap_err();
             }
@@ -1222,7 +1258,7 @@ async fn wait_for_loader_device(app: &AppHandle, state: &AppState) -> Result<Dev
     ))
 }
 
-fn loader_flash_probe_needs_retry(probe: &Result<(), String>) -> bool {
+fn loader_flash_probe_needs_retry<T>(probe: &Result<T, String>) -> bool {
     probe.is_err()
 }
 
@@ -1259,7 +1295,7 @@ pub async fn upgrade_firmware(
         .map_err(|e| e.to_string())??;
         emit_lines(&app, &firmware.log);
 
-        let mut device = if selected_device_is_maskrom(state.inner()).await? {
+        let (mut device, flash_info) = if selected_device_is_maskrom(state.inner()).await? {
             let loader_path = firmware.loader_path.as_ref().ok_or_else(|| {
                 "Firmware has no download.bin or MiniLoaderAll.bin for Maskrom Boot download"
                     .to_string()
@@ -1274,14 +1310,15 @@ pub async fn upgrade_firmware(
             drop(maskrom_device);
             wait_for_loader_device(&app, state.inner()).await?
         } else {
-            open_selected_device(state.inner()).await?
+            let mut device = open_selected_device(state.inner()).await?;
+            let flash_info = device
+                .flash_info()
+                .await
+                .map_err(|e| format!("Read Flash info failed: {e}"))?;
+            (device, flash_info)
         };
 
-        let flash_sectors = device
-            .flash_info()
-            .await
-            .map_err(|e| format!("Read Flash info failed after Loader download: {e}"))?
-            .sectors();
+        let flash_sectors = flash_info.sectors();
         if flash_sectors == 0 {
             return Err("Flash reports 0 sectors".to_string());
         }
@@ -1414,7 +1451,7 @@ pub async fn download_execute(
             emit_lines(&app, &log);
             if was_maskrom {
                 drop(device);
-                device = wait_for_loader_device(&app, state.inner()).await?;
+                device = wait_for_loader_device(&app, state.inner()).await?.0;
             }
         }
 
@@ -1922,7 +1959,7 @@ mod tests {
 
     #[test]
     fn loader_flash_probe_retries_until_the_device_is_ready() {
-        assert!(loader_flash_probe_needs_retry(&Err(
+        assert!(loader_flash_probe_needs_retry(&Err::<FlashInfo, _>(
             "No Rockchip device found (enter Maskrom/Loader)".to_string()
         )));
         assert!(!loader_flash_probe_needs_retry(&Ok(())));
