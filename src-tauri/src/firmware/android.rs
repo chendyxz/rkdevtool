@@ -42,6 +42,7 @@ pub(crate) struct GptPartition {
     pub name: String,
     pub start_sector: u64,
     pub sector_count: Option<u64>,
+    pub unique_guid: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +78,7 @@ pub(crate) fn parse_parameter_partitions(data: &[u8]) -> Result<Option<Vec<GptPa
         .split_once(':')
         .ok_or_else(|| "GPT parameter CMDLINE has no mtdparts entries".to_string())?;
 
+    let partition_guids = parse_parameter_partition_guids(&text)?;
     let mut partitions = Vec::new();
     for entry in entries.split(',') {
         let (size, rest) = entry
@@ -103,10 +105,12 @@ pub(crate) fn parse_parameter_partitions(data: &[u8]) -> Result<Option<Vec<GptPa
         } else {
             Some(parse_hex_sector(size.trim())?)
         };
+        let normalized_name = name.to_ascii_lowercase();
         partitions.push(GptPartition {
             name: name.to_string(),
             start_sector: parse_hex_sector(offset.trim())?,
             sector_count,
+            unique_guid: partition_guids.get(&normalized_name).copied(),
         });
     }
 
@@ -114,6 +118,67 @@ pub(crate) fn parse_parameter_partitions(data: &[u8]) -> Result<Option<Vec<GptPa
         return Err("Parameter has no partitions".to_string());
     }
     Ok(Some(partitions))
+}
+
+/// Read Rockchip parameter entries such as `uuid:rootfs=614e0000-...`.
+/// GPT stores the first three UUID fields as little-endian integers.
+fn parse_parameter_partition_guids(
+    text: &str,
+) -> Result<std::collections::HashMap<String, [u8; 16]>, String> {
+    let mut guids = std::collections::HashMap::new();
+
+    for line in text.split(['\0', '\n', '\r']) {
+        let Some((name, value)) = line
+            .trim()
+            .strip_prefix("uuid:")
+            .and_then(|entry| entry.split_once('='))
+        else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || !name.is_ascii() {
+            return Err(format!("Invalid GPT partition UUID name: {name}"));
+        }
+        guids.insert(name.to_ascii_lowercase(), parse_gpt_guid(value.trim())?);
+    }
+
+    Ok(guids)
+}
+
+fn parse_gpt_guid(value: &str) -> Result<[u8; 16], String> {
+    let groups: Vec<_> = value.split('-').collect();
+    let expected_lengths = [8, 4, 4, 4, 12];
+    if groups.len() != expected_lengths.len()
+        || groups
+            .iter()
+            .zip(expected_lengths)
+            .any(|(group, length)| group.len() != length)
+    {
+        return Err(format!("Invalid GPT partition UUID: {value}"));
+    }
+
+    let first = u32::from_str_radix(groups[0], 16)
+        .map_err(|_| format!("Invalid GPT partition UUID: {value}"))?;
+    let second = u16::from_str_radix(groups[1], 16)
+        .map_err(|_| format!("Invalid GPT partition UUID: {value}"))?;
+    let third = u16::from_str_radix(groups[2], 16)
+        .map_err(|_| format!("Invalid GPT partition UUID: {value}"))?;
+
+    let mut guid = [0u8; 16];
+    guid[0..4].copy_from_slice(&first.to_le_bytes());
+    guid[4..6].copy_from_slice(&second.to_le_bytes());
+    guid[6..8].copy_from_slice(&third.to_le_bytes());
+    for (index, pair) in format!("{}{}", groups[3], groups[4])
+        .as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+    {
+        let hex = std::str::from_utf8(pair)
+            .map_err(|_| format!("Invalid GPT partition UUID: {value}"))?;
+        guid[8 + index] = u8::from_str_radix(hex, 16)
+            .map_err(|_| format!("Invalid GPT partition UUID: {value}"))?;
+    }
+    Ok(guid)
 }
 
 pub(crate) fn parse_sparse_header(data: &[u8]) -> Result<Option<SparseHeader>, String> {
@@ -247,7 +312,9 @@ pub(crate) fn build_gpt_tables(
     for (index, (partition, end_sector)) in resolved.iter().enumerate() {
         let entry = &mut entries[index * GPT_ENTRY_SIZE..(index + 1) * GPT_ENTRY_SIZE];
         entry[..16].copy_from_slice(&BASIC_DATA_GUID);
-        entry[16] = (index + 1) as u8;
+        let mut unique_guid = [0u8; 16];
+        unique_guid[0] = (index + 1) as u8;
+        entry[16..32].copy_from_slice(&partition.unique_guid.unwrap_or(unique_guid));
         entry[32..40].copy_from_slice(&partition.start_sector.to_le_bytes());
         entry[40..48].copy_from_slice(&end_sector.to_le_bytes());
         for (offset, codepoint) in partition.name.encode_utf16().take(36).enumerate() {
@@ -346,6 +413,7 @@ mod tests {
     use super::*;
 
     const PARAMETER: &[u8] = b"PARM\0TYPE: GPT\0CMDLINE:mtdparts=rk29xxnand:0x00002000@0x00002000(security),0x00002000@0x00004000(uboot),0x00014000@0x0000c800(boot),-@0x00020800(userdata:grow)\0";
+    const PARAMETER_WITH_ROOTFS_UUID: &[u8] = b"PARM\0TYPE: GPT\0CMDLINE:mtdparts=rk29xxnand:0x00020000@0x00008000(boot),0x00c00000@0x00078000(rootfs)\nuuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9\0";
 
     #[test]
     fn parses_gpt_partition_ranges_from_rockchip_parameter() {
@@ -403,6 +471,23 @@ mod tests {
             0x207ff
         );
         assert_eq!(tables.backup_start_sector, 0x0080_0000 - 33);
+    }
+
+    #[test]
+    fn generated_gpt_preserves_partition_uuid_from_parameter() {
+        let partitions = parse_gpt_parameter(PARAMETER_WITH_ROOTFS_UUID)
+            .unwrap()
+            .unwrap();
+        let tables = build_gpt_tables(&partitions, 0x0100_0000).unwrap();
+        let rootfs_entry = 2 * SECTOR_SIZE + 128;
+
+        assert_eq!(
+            &tables.primary[rootfs_entry + 16..rootfs_entry + 32],
+            &[
+                0x00, 0x00, 0x4e, 0x61, 0x00, 0x00, 0x53, 0x4b, 0x80, 0x00, 0x1d, 0x28, 0x00, 0x00,
+                0x54, 0xa9
+            ]
+        );
     }
 
     #[test]
