@@ -11,10 +11,15 @@ use tauri::{AppHandle, Emitter, State};
 use rockfile::boot::{
     RkBootEntry, RkBootEntryBytes, RkBootHeader, RkBootHeaderBytes, RkBootHeaderEntry,
 };
+#[cfg(not(target_os = "windows"))]
 use rockusb::nusb::Device;
 use rockusb::protocol::{Capability, ChipInfo, FlashId, FlashInfo, ResetOpcode, StorageIndex};
+#[cfg(target_os = "windows")]
+use rockusb::windows::Device;
 
-use crate::devices::{self, format_location_id_for, is_rockusb_device_info};
+use crate::devices;
+#[cfg(not(target_os = "windows"))]
+use crate::devices::{format_location_id_for, is_rockusb_device_info};
 use crate::firmware::{
     build_gpt_tables, extract_firmware_for_upgrade, parse_gpt_parameter,
     parse_parameter_partitions, parse_sparse_chunk_header, parse_sparse_header, FirmwareImage,
@@ -264,6 +269,7 @@ fn format_capability(cap: &Capability) -> String {
     lines.join("\n")
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn open_selected_device(state: &AppState) -> Result<Device, String> {
     let selected = state
         .selected_device
@@ -297,6 +303,51 @@ async fn open_selected_device(state: &AppState) -> Result<Device, String> {
         .map_err(|e| format!("Failed to open RockUSB device: {e}"))
 }
 
+#[cfg(target_os = "windows")]
+fn selected_driver_device(state: &AppState) -> Result<rockusb::windows::DeviceInfo, String> {
+    let selected = state
+        .selected_device
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let infos = rockusb::windows::devices()
+        .map_err(|e| format!("Failed to list installed Rockusb driver interfaces: {e}"))?;
+
+    if infos.is_empty() {
+        return Err(
+            "No Rockchip device with the official Rockusb driver found (enter Maskrom/Loader)"
+                .to_string(),
+        );
+    }
+
+    let info = match selected.as_deref().filter(|path| !path.is_empty()) {
+        Some(path) => infos
+            .iter()
+            .find(|info| info.interface_path == path)
+            .cloned()
+            // A Maskrom boot download causes Windows to publish a new interface path.  When it
+            // is the sole device, safely follow that transition instead of retaining a stale path.
+            .or_else(|| (infos.len() == 1).then(|| infos[0].clone()))
+            .ok_or_else(|| format!("Selected device {path} is no longer connected"))?,
+        None if infos.len() == 1 => infos[0].clone(),
+        None => return Err("Multiple devices connected; select one in the status bar".to_string()),
+    };
+
+    if selected.as_deref() != Some(info.interface_path.as_str()) {
+        *state.selected_device.lock().map_err(|e| e.to_string())? =
+            Some(info.interface_path.clone());
+    }
+    Ok(info)
+}
+
+#[cfg(target_os = "windows")]
+async fn open_selected_device(state: &AppState) -> Result<Device, String> {
+    let info = selected_driver_device(state)?;
+    Device::from_interface_path(&info.interface_path)
+        .map_err(|e| format!("Failed to open installed Rockusb driver: {e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
 async fn selected_device_is_maskrom(state: &AppState) -> Result<bool, String> {
     let selected = state
         .selected_device
@@ -323,6 +374,11 @@ async fn selected_device_is_maskrom(state: &AppState) -> Result<bool, String> {
     };
 
     Ok(info.usb_version() & 1 == 0)
+}
+
+#[cfg(target_os = "windows")]
+async fn selected_device_is_maskrom(state: &AppState) -> Result<bool, String> {
+    Ok(selected_driver_device(state)?.mode == rockusb::windows::DeviceMode::Maskrom)
 }
 
 async fn with_busy_device<F, Fut, T>(

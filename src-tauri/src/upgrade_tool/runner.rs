@@ -614,6 +614,16 @@ fn tool_argv(device_id: Option<&str>, args: &[String]) -> Vec<String> {
 }
 
 fn device_arg_for_tool(state: &State<'_, AppState>, selected: Option<String>) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // The Windows UI selection is a SetupAPI device-interface path for CreateFileW.
+        // `upgrade_tool -s` expects its own numeric LocationID, so passing this path would be
+        // invalid. RockUSB actions use the driver transport; remaining tool actions rescan.
+        let _ = (state, selected);
+        return None;
+    }
+
+    #[cfg(not(target_os = "windows"))]
     pick_device_arg(
         state
             .last_devices

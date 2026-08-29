@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use futures::StreamExt;
 use nusb::hotplug::HotplugEvent;
-use nusb::{DeviceId, DeviceInfo};
+#[cfg(not(target_os = "windows"))]
+use nusb::DeviceInfo;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, oneshot};
 
@@ -31,15 +32,18 @@ pub enum HotplugCmd {
 
 /// Same filter as rkdeveloptool `IsRockusbDevice` for VID 0x2207:
 /// MSC gadgets use PID with high byte 0 (e.g. 0x0010).
+#[cfg(not(target_os = "windows"))]
 pub fn is_rockusb_device_info(info: &DeviceInfo) -> bool {
     info.vendor_id() == ROCKCHIP_VID && (info.product_id() >> 8) > 0
 }
 
+#[cfg(not(target_os = "windows"))]
 fn is_rockusb_device(info: &DeviceInfo) -> bool {
     is_rockusb_device_info(info)
 }
 
 /// Maskrom vs Loader from `bcdUSB` LSB (not PID).
+#[cfg(not(target_os = "windows"))]
 fn detect_mode(info: &DeviceInfo) -> &'static str {
     if info.usb_version() & 1 == 0 {
         "Maskrom"
@@ -49,10 +53,12 @@ fn detect_mode(info: &DeviceInfo) -> &'static str {
 }
 
 /// Build LocationID string compatible with `upgrade_tool -s`.
+#[cfg(not(target_os = "windows"))]
 pub fn format_location_id_for(info: &DeviceInfo) -> String {
     format_location_id(info)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn format_location_id(info: &DeviceInfo) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -70,29 +76,13 @@ fn format_location_id(info: &DeviceInfo) -> String {
         format!("{id}")
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        // Best-effort stable id; multi-device `-s` may need tuning per upgrade_tool build.
-        let port = info.port_number();
-        let chain: String = info
-            .port_chain()
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(".");
-        if chain.is_empty() {
-            format!("{port}")
-        } else {
-            format!("{port}:{chain}")
-        }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         format!("{}:{}", info.bus_id(), info.device_address())
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn device_from_info(info: &DeviceInfo) -> RockusbDevice {
     let location_id = format_location_id(info);
     let mode = detect_mode(info).to_string();
@@ -103,7 +93,7 @@ fn device_from_info(info: &DeviceInfo) -> RockusbDevice {
     }
 }
 
-fn snapshot_devices(map: &HashMap<DeviceId, RockusbDevice>) -> Vec<RockusbDevice> {
+fn snapshot_devices(map: &HashMap<String, RockusbDevice>) -> Vec<RockusbDevice> {
     let mut devices: Vec<_> = map.values().cloned().collect();
     devices.sort_by(|a, b| a.location_id.cmp(&b.location_id));
     devices
@@ -162,14 +152,37 @@ pub fn cached_devices(state: &AppState) -> Result<Vec<RockusbDevice>, String> {
         .collect())
 }
 
-async fn enumerate_rockusb_map() -> Result<HashMap<DeviceId, RockusbDevice>, String> {
+#[cfg(not(target_os = "windows"))]
+async fn enumerate_rockusb_map() -> Result<HashMap<String, RockusbDevice>, String> {
     let iter = nusb::list_devices()
         .await
         .map_err(|e| format!("Failed to list USB devices: {e}"))?;
 
     let mut map = HashMap::new();
     for info in iter.filter(is_rockusb_device) {
-        map.insert(info.id(), device_from_info(&info));
+        let device = device_from_info(&info);
+        map.insert(device.location_id.clone(), device);
+    }
+    Ok(map)
+}
+
+#[cfg(target_os = "windows")]
+async fn enumerate_rockusb_map() -> Result<HashMap<String, RockusbDevice>, String> {
+    let mut map = HashMap::new();
+    for info in rockusb::windows::devices()
+        .map_err(|e| format!("Failed to enumerate installed Rockusb driver interfaces: {e}"))?
+    {
+        let device = RockusbDevice {
+            // The interface path is the only stable identifier accepted by CreateFileW.
+            location_id: info.interface_path.clone(),
+            mode: info.mode.as_str().to_string(),
+            label: format!(
+                "{} : {}",
+                info.instance_id,
+                info.mode.as_str().to_ascii_uppercase()
+            ),
+        };
+        map.insert(device.location_id.clone(), device);
     }
     Ok(map)
 }
@@ -177,7 +190,7 @@ async fn enumerate_rockusb_map() -> Result<HashMap<DeviceId, RockusbDevice>, Str
 fn publish_map(
     app: &AppHandle,
     state: &AppState,
-    map: &HashMap<DeviceId, RockusbDevice>,
+    map: &HashMap<String, RockusbDevice>,
 ) -> Result<Vec<RockusbDevice>, String> {
     let devices = snapshot_devices(map);
     publish_devices(app, state, &devices)?;
@@ -264,16 +277,11 @@ async fn hotplug_loop(
             }
             event = watch.next() => {
                 match event {
-                    Some(HotplugEvent::Connected(info)) => {
-                        if is_rockusb_device(&info) {
-                            map.insert(info.id(), device_from_info(&info));
-                            publish_map(&app, state.inner(), &map)?;
-                        }
-                    }
-                    Some(HotplugEvent::Disconnected(id)) => {
-                        if map.remove(&id).is_some() {
-                            publish_map(&app, state.inner(), &map)?;
-                        }
+                    Some(HotplugEvent::Connected(_)) | Some(HotplugEvent::Disconnected(_)) => {
+                        // On Windows the official driver owns the device handle.  Re-scan the
+                        // driver interfaces rather than attempting to open the nusb event device.
+                        map = enumerate_rockusb_map().await?;
+                        publish_map(&app, state.inner(), &map)?;
                     }
                     None => {
                         return Err("USB hotplug stream ended".to_string());
