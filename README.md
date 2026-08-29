@@ -72,6 +72,14 @@ Get installers from [Releases](https://github.com/hiifong/rkdevtool/releases):
 - [Rust](https://rustup.rs/) stable
 - Platform deps: [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 
+**Windows Rockusb driver**
+
+Windows requires the official Rockchip `Rockusb` driver for device discovery and
+flashing. Install it with Rockchip's DriverAssistant / official RKDevTool package,
+then unplug and reconnect the board or re-enter Maskrom mode. In Device Manager,
+the board should be bound to the Rockchip Rockusb driver rather than an unknown,
+ADB, or generic WinUSB device. RKDevTool does not install or bundle this driver.
+
 Linux extras:
 
 ```bash
@@ -204,6 +212,13 @@ macOS signing & notarization secrets:
 - [Node.js](https://nodejs.org/) 18+
 - [Rust](https://rustup.rs/) stable
 - 平台依赖见 [Tauri 前置条件](https://v2.tauri.app/start/prerequisites/)
+
+**Windows Rockusb 驱动**
+
+Windows 下必须安装瑞芯微官方 `Rockusb` 驱动，设备发现和烧录功能才能正常工作。
+请使用瑞芯微 DriverAssistant 或官方 RKDevTool 软件包安装驱动，然后重新插拔设备，
+或重新进入 Maskrom 模式。在设备管理器中，应确认设备已绑定 Rockchip Rockusb 驱动，
+而不是未知设备、ADB 驱动或通用 WinUSB 驱动。RKDevTool 不会自动安装或内置该驱动。
 
 Linux 额外依赖：
 

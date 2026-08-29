@@ -169,18 +169,18 @@ async fn enumerate_rockusb_map() -> Result<HashMap<String, RockusbDevice>, Strin
 #[cfg(target_os = "windows")]
 async fn enumerate_rockusb_map() -> Result<HashMap<String, RockusbDevice>, String> {
     let mut map = HashMap::new();
-    for info in rockusb::windows::devices()
+    for info in rockusb::windows::devices_with_modes()
+        .await
         .map_err(|e| format!("Failed to enumerate installed Rockusb driver interfaces: {e}"))?
     {
+        let short_location = info
+            .short_location
+            .unwrap_or_else(|| "Rockchip".to_string());
         let device = RockusbDevice {
             // The interface path is the only stable identifier accepted by CreateFileW.
             location_id: info.interface_path.clone(),
             mode: info.mode.as_str().to_string(),
-            label: format!(
-                "{} : {}",
-                info.instance_id,
-                info.mode.as_str().to_ascii_uppercase()
-            ),
+            label: format!("{short_location} : {}", info.mode.as_str().to_ascii_uppercase()),
         };
         map.insert(device.location_id.clone(), device);
     }

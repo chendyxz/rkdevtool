@@ -41,7 +41,8 @@ const READ_LBA_CHUNK: u32 = 128;
 
 const SECTOR_SIZE: usize = 512;
 const WRITE_LBA_CHUNK: usize = READ_LBA_CHUNK as usize * SECTOR_SIZE;
-const LOADER_READY_RETRIES: usize = 20;
+// Match upgrade_tool's ROCKUSB_TIMEOUT=30 while allowing for USB re-enumeration.
+const LOADER_READY_RETRIES: usize = 120;
 const LOADER_READY_INTERVAL: Duration = Duration::from_millis(250);
 const PARAMETER_START_SECTOR: u32 = 0x20;
 const PARAMETER_READ_SECTORS: u32 = 128;
@@ -304,7 +305,7 @@ async fn open_selected_device(state: &AppState) -> Result<Device, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn selected_driver_device_with_mode(
+async fn selected_driver_device_with_mode(
     state: &AppState,
     required_mode: Option<rockusb::windows::DeviceMode>,
 ) -> Result<rockusb::windows::DeviceInfo, String> {
@@ -313,7 +314,8 @@ fn selected_driver_device_with_mode(
         .lock()
         .map_err(|e| e.to_string())?
         .clone();
-    let mut infos = rockusb::windows::devices()
+    let mut infos = rockusb::windows::devices_with_modes()
+        .await
         .map_err(|e| format!("Failed to list installed Rockusb driver interfaces: {e}"))?;
 
     if let Some(mode) = required_mode {
@@ -358,20 +360,21 @@ fn selected_driver_device_with_mode(
 }
 
 #[cfg(target_os = "windows")]
-fn selected_driver_device(state: &AppState) -> Result<rockusb::windows::DeviceInfo, String> {
-    selected_driver_device_with_mode(state, None)
+async fn selected_driver_device(state: &AppState) -> Result<rockusb::windows::DeviceInfo, String> {
+    selected_driver_device_with_mode(state, None).await
 }
 
 #[cfg(target_os = "windows")]
 async fn open_selected_device(state: &AppState) -> Result<Device, String> {
-    let info = selected_driver_device(state)?;
+    let info = selected_driver_device(state).await?;
     Device::from_interface_path(&info.interface_path)
         .map_err(|e| format!("Failed to open installed Rockusb driver: {e}"))
 }
 
 #[cfg(target_os = "windows")]
 async fn open_loader_device(state: &AppState) -> Result<Device, String> {
-    let info = selected_driver_device_with_mode(state, Some(rockusb::windows::DeviceMode::Loader))?;
+    let info =
+        selected_driver_device_with_mode(state, Some(rockusb::windows::DeviceMode::Loader)).await?;
     Device::from_interface_path(&info.interface_path)
         .map_err(|e| format!("Failed to open installed Rockusb Loader driver: {e}"))
 }
@@ -412,7 +415,7 @@ async fn selected_device_is_maskrom(state: &AppState) -> Result<bool, String> {
 
 #[cfg(target_os = "windows")]
 async fn selected_device_is_maskrom(state: &AppState) -> Result<bool, String> {
-    Ok(selected_driver_device(state)?.mode == rockusb::windows::DeviceMode::Maskrom)
+    Ok(selected_driver_device(state).await?.mode == rockusb::windows::DeviceMode::Maskrom)
 }
 
 async fn with_busy_device<F, Fut, T>(
@@ -1216,7 +1219,10 @@ fn create_upgrade_temp_dir() -> Result<PathBuf, String> {
 }
 
 fn loader_ready_progress_percent(attempt: usize) -> u64 {
-    (attempt as u64 * 100) / LOADER_READY_RETRIES as u64
+    if attempt == 0 {
+        return 0;
+    }
+    ((attempt as u64 * 100) / LOADER_READY_RETRIES as u64).clamp(1, 99)
 }
 
 fn download_requires_reset(has_images: bool) -> bool {
@@ -1236,20 +1242,39 @@ async fn wait_for_loader_device(
                 loader_ready_progress_percent(attempt)
             ),
         );
+        // Prefer a newly enumerated Loader interface. During the transition from
+        // Maskrom, Windows can keep the old interface visible for a while, so
+        // also probe the currently selected Rockusb interface as a fallback.
         match open_loader_device(state).await {
             Ok(mut device) => {
-                let probe = device
-                    .flash_info()
-                    .await
-                    .map_err(|err| format!("Flash is not ready: {err}"));
-                if !loader_flash_probe_needs_retry(&probe) {
-                    emit_progress(app, "Waiting for Loader... (100%)".to_string());
-                    emit_log(app, "Loader is ready");
-                    return Ok((device, probe.expect("successful Loader flash probe")));
+                match device.flash_info().await {
+                    Ok(info) => {
+                        emit_progress(app, "Waiting for Loader... (100%)".to_string());
+                        emit_log(app, "Loader is ready");
+                        return Ok((device, info));
+                    }
+                    Err(err) => {
+                        last_status = format!("Flash is not ready: {err}");
+                    }
                 }
-                last_status = probe.unwrap_err();
             }
-            Err(err) => last_status = err,
+            Err(loader_err) => match open_selected_device(state).await {
+                Ok(mut device) => match device.flash_info().await {
+                    Ok(info) => {
+                        emit_progress(app, "Waiting for Loader... (100%)".to_string());
+                        emit_log(app, "Loader is ready");
+                        return Ok((device, info));
+                    }
+                    Err(err) => {
+                        last_status = format!(
+                            "{loader_err}; current interface probe failed: {err}"
+                        );
+                    }
+                },
+                Err(current_err) => {
+                    last_status = format!("{loader_err}; current interface unavailable: {current_err}");
+                }
+            },
         }
         thread::sleep(LOADER_READY_INTERVAL);
     }
@@ -1258,8 +1283,13 @@ async fn wait_for_loader_device(
     ))
 }
 
-fn loader_flash_probe_needs_retry<T>(probe: &Result<T, String>) -> bool {
-    probe.is_err()
+async fn open_loader_and_read_flash_info(state: &AppState) -> Result<(Device, FlashInfo), String> {
+    let mut device = open_loader_device(state).await?;
+    let info = device
+        .flash_info()
+        .await
+        .map_err(|e| format!("Read Flash info failed: {e}"))?;
+    Ok((device, info))
 }
 
 /// Extract a firmware package, download its Loader in Maskrom, then write every package entry via RockUSB LBA.
@@ -1310,12 +1340,7 @@ pub async fn upgrade_firmware(
             drop(maskrom_device);
             wait_for_loader_device(&app, state.inner()).await?
         } else {
-            let mut device = open_selected_device(state.inner()).await?;
-            let flash_info = device
-                .flash_info()
-                .await
-                .map_err(|e| format!("Read Flash info failed: {e}"))?;
-            (device, flash_info)
+            open_loader_and_read_flash_info(state.inner()).await?
         };
 
         let flash_sectors = flash_info.sectors();
@@ -1538,7 +1563,7 @@ pub async fn reset_device(
     opcode: ResetOpcode,
 ) -> Result<String, String> {
     let label = opcode.to_string();
-    with_busy_device(
+    let result = with_busy_device(
         &app,
         &state,
         &format!("reset-device {label}"),
@@ -1548,14 +1573,18 @@ pub async fn reset_device(
                 .await
                 .map_err(|e| format!("Reset device failed: {e}"))?;
             let output = match opcode {
-                ResetOpcode::Maskrom => "Enter Maskrom Success".to_string(),
+                ResetOpcode::Maskrom => {
+                    "Maskrom reset command acknowledged; waiting for USB re-enumeration".to_string()
+                }
                 ResetOpcode::Reset => "Reset Device Success".to_string(),
                 other => format!("Reset device ({other}) success"),
             };
             Ok((output.clone(), output))
         },
     )
-    .await
+    .await?;
+
+    Ok(result)
 }
 
 /// Plan LBA operation chunks: `(offset, count)` pairs.
@@ -1955,14 +1984,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn loader_flash_probe_retries_until_the_device_is_ready() {
-        assert!(loader_flash_probe_needs_retry(&Err::<FlashInfo, _>(
-            "No Rockchip device found (enter Maskrom/Loader)".to_string()
-        )));
-        assert!(!loader_flash_probe_needs_retry(&Ok(())));
     }
 
     #[test]
