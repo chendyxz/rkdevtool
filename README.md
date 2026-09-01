@@ -31,7 +31,7 @@ A modern alternative to the official Windows-only RKDevTool, with real-time logs
 | Page | Description |
 |------|-------------|
 | **Download Image** | Flash Loader and partition images through RockUSB; supports partition-table and write-by-address modes |
-| **Upgrade Firmware** | Extract an `update.img` to a temporary directory, download its Loader, then write each partition through RockUSB |
+| **Upgrade Firmware** | Extract an `update.img` to a temporary directory, install its Loader IDBlock, then write each partition through RockUSB |
 | **Advanced** | Download Boot, extract firmware, read chip/Flash/Capability info, erase, reboot, switch storage, export images, and more |
 
 - Auto-poll RockUSB devices; status bar shows Maskrom / Loader mode
@@ -50,7 +50,7 @@ Only a small compatibility surface still launches the official `upgrade_tool`:
 - Export serial log (`RCL`)
 - Switch USB3 (`SSD`)
 
-The bundled binary is still checked at startup and remains required for these compatibility features. It will be removed from the normal flashing path as the remaining commands are implemented in Rust.
+The bundled binary is still checked at startup and remains required for these compatibility features. Firmware Loader/IDBlock and partition writes remain native Rust/RockUSB. It will be removed from the normal flashing path as the remaining commands are implemented in Rust.
 
 ### Download
 
@@ -172,7 +172,7 @@ macOS signing & notarization secrets:
 | 页面 | 说明 |
 |------|------|
 | **下载镜像** | 通过 RockUSB 按分区表烧录 Loader / 各分区镜像，支持按地址写入 |
-| **升级固件** | 将 `update.img` 解包到临时目录，下载 Loader 后通过 RockUSB 写入各分区 |
+| **升级固件** | 将 `update.img` 解包到临时目录，安装 Loader IDBlock 后通过 RockUSB 写入各分区 |
 | **高级功能** | 下载 Boot、解包固件、读取芯片/Flash/Capability 信息，以及擦除、重启、切换存储、导出镜像等操作 |
 
 - 自动轮询 RockUSB 设备，状态栏显示当前连接模式（Maskrom / Loader）
@@ -191,7 +191,7 @@ macOS signing & notarization secrets:
 - 导出串口日志（`RCL`）
 - 切换 USB3（`SSD`）
 
-应用启动时仍会检查内置二进制，且上述兼容功能仍需要它。随着剩余命令被逐步实现为 Rust，正常刷机流程对官方工具的依赖将继续缩小。
+应用启动时仍会检查内置二进制，且上述兼容功能仍需要它。固件 Loader/IDBlock 和分区写入均由原生 Rust/RockUSB 完成。随着剩余命令被逐步实现为 Rust，正常刷机流程对官方工具的依赖将继续缩小。
 
 ### 下载
 

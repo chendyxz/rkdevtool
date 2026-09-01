@@ -41,11 +41,18 @@ const READ_LBA_CHUNK: u32 = 128;
 
 const SECTOR_SIZE: usize = 512;
 const WRITE_LBA_CHUNK: usize = READ_LBA_CHUNK as usize * SECTOR_SIZE;
-// Match upgrade_tool's ROCKUSB_TIMEOUT=30 while allowing for USB re-enumeration.
+// Match upgrade_tool's 30-second RockUSB timeout while allowing for USB re-enumeration.
 const LOADER_READY_RETRIES: usize = 120;
 const LOADER_READY_INTERVAL: Duration = Duration::from_millis(250);
+// Match rkdeveloptool `CRKDevice::DownloadBoot`, which waits after the final 0x472 upload.
+const LOADER_BOOT_SETTLE_DELAY: Duration = Duration::from_secs(1);
 const PARAMETER_START_SECTOR: u32 = 0x20;
 const PARAMETER_READ_SECTORS: u32 = 128;
+/// Firmware package parameter entries have a metadata offset of zero. Rockchip's
+/// `PRM` command persists their PARM payload at this fixed flash address.
+const FIRMWARE_PARAMETER_START_SECTOR: u64 = 0x2000;
+const IDBLOCK_START_SECTOR: u32 = 0x40;
+const IDBLOCK_ALIGNMENT: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DownloadPartition {
@@ -599,6 +606,9 @@ async fn download_boot_to_device(device: &mut Device, boot_path: &Path) -> Resul
     let mut log = String::from("Download Boot Start\n");
     download_boot_entry(device, header.entry_471, 0x471, &mut file, &mut log).await?;
     download_boot_entry(device, header.entry_472, 0x472, &mut file, &mut log).await?;
+    // The temporary USB Loader takes over the controller asynchronously after 0x472.
+    // Do not probe the departing Maskrom interface during this handoff.
+    thread::sleep(LOADER_BOOT_SETTLE_DELAY);
     log.push_str("Download Boot Success");
     Ok(log)
 }
@@ -789,6 +799,298 @@ fn image_for_download(
         flash_size_sectors: partition.sector_count.unwrap_or(0),
         byte_count,
     })
+}
+
+fn loader_entry_data(
+    bytes: &[u8],
+    entries: RkBootHeaderEntry,
+    name: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if entries.size < 57 {
+        return Err("Loader entry table is smaller than a boot entry".to_string());
+    }
+
+    for index in 0..entries.count {
+        let entry_offset = u64::from(entries.offset)
+            .checked_add(u64::from(entries.size) * u64::from(index))
+            .ok_or_else(|| "Loader entry table offset overflows".to_string())?;
+        let entry_offset = usize::try_from(entry_offset)
+            .map_err(|_| "Loader entry table offset is too large".to_string())?;
+        let entry_end = entry_offset
+            .checked_add(57)
+            .ok_or_else(|| "Loader entry table range overflows".to_string())?;
+        let entry_bytes = bytes
+            .get(entry_offset..entry_end)
+            .ok_or_else(|| "Loader entry table is truncated".to_string())?;
+        let entry = RkBootEntry::from_bytes(entry_bytes.try_into().unwrap());
+        let entry_name = String::from_utf16_lossy(&entry.name)
+            .trim_end_matches('\0')
+            .to_string();
+        if !entry_name.eq_ignore_ascii_case(name) {
+            continue;
+        }
+
+        let start = entry.data_offset as usize;
+        let end = start
+            .checked_add(entry.data_size as usize)
+            .ok_or_else(|| format!("Loader entry {name} range overflows"))?;
+        return bytes
+            .get(start..end)
+            .map(|data| Some(data.to_vec()))
+            .ok_or_else(|| format!("Loader entry {name} is truncated"));
+    }
+    Ok(None)
+}
+
+fn align_idblock_bytes(byte_count: usize) -> Result<usize, String> {
+    byte_count
+        .checked_add(IDBLOCK_ALIGNMENT - 1)
+        .map(|size| size & !(IDBLOCK_ALIGNMENT - 1))
+        .ok_or_else(|| "Loader IDBlock is too large".to_string())
+}
+
+fn rc4_crypt(data: &mut [u8]) {
+    const KEY: [u8; 16] = [124, 78, 3, 4, 85, 5, 9, 7, 45, 44, 123, 56, 23, 13, 23, 17];
+    let mut state = [0u8; 256];
+    for (index, value) in state.iter_mut().enumerate() {
+        *value = index as u8;
+    }
+    let mut j = 0usize;
+    for index in 0..256 {
+        j = (j + usize::from(state[index]) + usize::from(KEY[index & 0x0f])) & 0xff;
+        state.swap(index, j);
+    }
+    let mut i = 0usize;
+    j = 0;
+    for value in data {
+        i = (i + 1) & 0xff;
+        j = (j + usize::from(state[i])) & 0xff;
+        state.swap(i, j);
+        *value ^= state[(usize::from(state[i]) + usize::from(state[j])) & 0xff];
+    }
+}
+
+fn rc4_full_sectors(data: &mut [u8]) {
+    for sector in data.chunks_exact_mut(SECTOR_SIZE) {
+        rc4_crypt(sector);
+    }
+}
+
+fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for byte in data {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn rockchip_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for byte in data {
+        crc ^= u32::from(*byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04c1_1db7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn new_idblock(
+    mut head: Vec<u8>,
+    mut boost: Option<Vec<u8>>,
+    mut data: Vec<u8>,
+    mut boot: Vec<u8>,
+    rc4_enabled: bool,
+) -> Result<Vec<u8>, String> {
+    if rc4_enabled {
+        rc4_full_sectors(&mut head);
+        if let Some(boost) = boost.as_deref_mut() {
+            rc4_full_sectors(boost);
+        }
+        rc4_full_sectors(&mut data);
+        rc4_full_sectors(&mut boot);
+    }
+    let head_size = align_idblock_bytes(head.len())?;
+    let boost_size = boost
+        .as_ref()
+        .map(|boost| align_idblock_bytes(boost.len()))
+        .transpose()?
+        .unwrap_or(0);
+    let data_size = align_idblock_bytes(data.len())?;
+    let boot_size = align_idblock_bytes(boot.len())?;
+    let total = head_size
+        .checked_add(boost_size)
+        .and_then(|size| size.checked_add(data_size))
+        .and_then(|size| size.checked_add(boot_size))
+        .ok_or_else(|| "Loader IDBlock is too large".to_string())?;
+    let mut idblock = vec![0u8; total];
+    idblock[..head.len()].copy_from_slice(&head);
+    let data_offset = head_size + boost_size;
+    if let Some(boost) = boost {
+        idblock[head_size..head_size + boost.len()].copy_from_slice(&boost);
+    }
+    idblock[data_offset..data_offset + data.len()].copy_from_slice(&data);
+    let boot_offset = data_offset + data_size;
+    idblock[boot_offset..boot_offset + boot.len()].copy_from_slice(&boot);
+    Ok(idblock)
+}
+
+fn legacy_idblock(mut data: Vec<u8>, mut boot: Vec<u8>, rc4_enabled: bool) -> Result<Vec<u8>, String> {
+    let data_sectors = align_idblock_bytes(data.len())? / SECTOR_SIZE;
+    let boot_sectors = align_idblock_bytes(boot.len())? / SECTOR_SIZE;
+    let data_sectors = u16::try_from(data_sectors)
+        .map_err(|_| "Loader data is too large for a legacy IDBlock".to_string())?;
+    let boot_sectors = u16::try_from(boot_sectors)
+        .map_err(|_| "Loader code is too large for a legacy IDBlock".to_string())?;
+    let code_sectors = data_sectors
+        .checked_add(boot_sectors)
+        .ok_or_else(|| "Legacy IDBlock sector count overflows".to_string())?;
+    if rc4_enabled {
+        rc4_full_sectors(&mut data);
+        rc4_full_sectors(&mut boot);
+    }
+
+    let mut idblock = vec![0u8; (4 + usize::from(code_sectors)) * SECTOR_SIZE];
+    let mut sector0 = [0u8; SECTOR_SIZE];
+    sector0[..4].copy_from_slice(&0x0ff0_aa55u32.to_le_bytes());
+    sector0[8..12].copy_from_slice(&(rc4_enabled as u32).to_le_bytes());
+    sector0[12..14].copy_from_slice(&4u16.to_le_bytes());
+    sector0[14..16].copy_from_slice(&4u16.to_le_bytes());
+    sector0[506..508].copy_from_slice(&data_sectors.to_le_bytes());
+    sector0[508..510].copy_from_slice(&code_sectors.to_le_bytes());
+
+    let mut sector1 = [0u8; SECTOR_SIZE];
+    sector1[..2].copy_from_slice(&0x000cu16.to_le_bytes());
+    sector1[2..4].copy_from_slice(&0xffffu16.to_le_bytes());
+    sector1[10..14].copy_from_slice(&0x3832_4b52u32.to_le_bytes());
+
+    let mut sector2 = [0u8; SECTOR_SIZE];
+    sector2[491..494].copy_from_slice(b"VC\0");
+    sector2[494..496].copy_from_slice(&crc16_ccitt(&sector0).to_le_bytes());
+    sector2[496..498].copy_from_slice(&crc16_ccitt(&sector1).to_le_bytes());
+    sector2[506..510].copy_from_slice(b"CRC\0");
+
+    idblock[..SECTOR_SIZE].copy_from_slice(&sector0);
+    idblock[SECTOR_SIZE..SECTOR_SIZE * 2].copy_from_slice(&sector1);
+    idblock[SECTOR_SIZE * 4..SECTOR_SIZE * 4 + data.len()].copy_from_slice(&data);
+    let boot_start = SECTOR_SIZE * (4 + usize::from(data_sectors));
+    idblock[boot_start..boot_start + boot.len()].copy_from_slice(&boot);
+    sector2[498..502].copy_from_slice(&rockchip_crc32(&idblock[SECTOR_SIZE * 4..]).to_le_bytes());
+    sector2[510..512].copy_from_slice(&crc16_ccitt(&idblock[SECTOR_SIZE * 3..SECTOR_SIZE * 4]).to_le_bytes());
+    idblock[SECTOR_SIZE * 2..SECTOR_SIZE * 3].copy_from_slice(&sector2);
+    rc4_crypt(&mut idblock[..SECTOR_SIZE]);
+    rc4_crypt(&mut idblock[SECTOR_SIZE * 2..SECTOR_SIZE * 3]);
+    rc4_crypt(&mut idblock[SECTOR_SIZE * 3..SECTOR_SIZE * 4]);
+    Ok(idblock)
+}
+
+fn build_loader_idblock(loader_path: &Path, capability: &Capability) -> Result<(Vec<u8>, &'static str), String> {
+    let bytes = std::fs::read(loader_path)
+        .map_err(|e| format!("Read Loader {} failed: {e}", loader_path.display()))?;
+    let header_bytes: RkBootHeaderBytes = bytes
+        .get(..102)
+        .ok_or_else(|| "Loader is too small for a boot header".to_string())?
+        .try_into()
+        .unwrap();
+    let header = RkBootHeader::from_bytes(&header_bytes)
+        .ok_or_else(|| "Failed to parse Loader/Boot header".to_string())?;
+    let flash_boot = loader_entry_data(&bytes, header.entry_loader.clone(), "FlashBoot")?
+        .ok_or_else(|| "Loader has no FlashBoot entry".to_string())?;
+    let flash_data = loader_entry_data(&bytes, header.entry_loader.clone(), "FlashData")?
+        .ok_or_else(|| "Loader has no FlashData entry".to_string())?;
+    let flash_head = loader_entry_data(&bytes, header.entry_loader.clone(), "FlashHead")?;
+    let rc4_enabled = header.rc4_flag != 0;
+
+    match flash_head {
+        Some(head) => {
+            if !capability.new_idb() {
+                return Err("Loader requires New IDBlock support, but the device does not provide it".to_string());
+            }
+            let flash_boost = loader_entry_data(&bytes, header.entry_loader, "FlashBoost")?;
+            let layout = if flash_boost.is_some() {
+                "New IDBlock + FlashBoost"
+            } else {
+                "New IDBlock"
+            };
+            Ok((
+                new_idblock(head, flash_boost, flash_data, flash_boot, rc4_enabled)?,
+                layout,
+            ))
+        }
+        None => Ok((legacy_idblock(flash_data, flash_boot, rc4_enabled)?, "legacy IDBlock")),
+    }
+}
+
+async fn write_loader_idblock(
+    app: &AppHandle,
+    device: &mut Device,
+    loader_path: &Path,
+    flash_sectors: u32,
+) -> Result<(), String> {
+    let capability = device
+        .capability()
+        .await
+        .map_err(|e| format!("Read Loader capability failed: {e}"))?;
+    let (idblock, layout) = build_loader_idblock(loader_path, &capability)?;
+    let sectors = u32::try_from(idblock.len() / SECTOR_SIZE)
+        .map_err(|_| "Loader IDBlock is too large".to_string())?;
+    let end_sector = IDBLOCK_START_SECTOR
+        .checked_add(sectors)
+        .ok_or_else(|| "Loader IDBlock range overflows".to_string())?;
+    if end_sector > flash_sectors {
+        return Err("Loader IDBlock exceeds the target flash size".to_string());
+    }
+    emit_log(
+        app,
+        &format!(
+            "Writing Loader ({layout}): LBA 0x{IDBLOCK_START_SECTOR:08x}-0x{:08x} ({})",
+            end_sector.saturating_sub(1),
+            format_byte_count(idblock.len() as u64),
+        ),
+    );
+    let mut written = 0usize;
+    let mut last_progress_percent = None;
+    for chunk in idblock.chunks(WRITE_LBA_CHUNK) {
+        let sector = IDBLOCK_START_SECTOR
+            .checked_add(u32::try_from(written / SECTOR_SIZE).unwrap())
+            .ok_or_else(|| "Loader IDBlock address overflows".to_string())?;
+        let transferred = device
+            .write_lba(sector, chunk)
+            .await
+            .map_err(|e| format!("Write Loader IDBlock at LBA {sector} failed: {e}"))?;
+        if transferred as usize != chunk.len() {
+            return Err(format!(
+                "Short Loader IDBlock write at LBA {sector}: got {transferred} bytes, expected {}",
+                chunk.len()
+            ));
+        }
+        written += chunk.len();
+        let percent = (written as u64 * 100) / idblock.len() as u64;
+        if should_emit_progress(last_progress_percent, percent) {
+            emit_progress(
+                app,
+                format!(
+                    "Writing Loader ({layout})... {}/{} ({percent}%)",
+                    format_byte_count(written as u64),
+                    format_byte_count(idblock.len() as u64),
+                ),
+            );
+            last_progress_percent = Some(percent);
+        }
+    }
+    emit_log(app, &format!("Written Loader ({layout}) successfully"));
+    Ok(())
 }
 
 fn write_lba_chunk_plan(
@@ -1170,6 +1472,14 @@ fn is_parameter_image(image: &FirmwareImage) -> bool {
             .is_some_and(|name| name.eq_ignore_ascii_case("parameter.txt"))
 }
 
+fn firmware_write_target(image: &FirmwareImage) -> FirmwareImage {
+    let mut target = image.clone();
+    if is_parameter_image(&target) {
+        target.flash_offset_sectors = FIRMWARE_PARAMETER_START_SECTOR;
+    }
+    target
+}
+
 async fn write_gpt_tables(
     app: &AppHandle,
     device: &mut Device,
@@ -1348,17 +1658,18 @@ pub async fn upgrade_firmware(
             return Err("Flash reports 0 sectors".to_string());
         }
 
+        if let Some(loader_path) = firmware.loader_path.as_deref() {
+            write_loader_idblock(&app, &mut device, loader_path, flash_sectors).await?;
+        }
+
         let gpt_tables = gpt_tables_for_firmware(&firmware.images, flash_sectors)?;
-        let has_gpt_parameter = gpt_tables.is_some();
         if let Some(tables) = gpt_tables.as_ref() {
             write_gpt_tables(&app, &mut device, tables).await?;
         }
 
         for image in &firmware.images {
-            if has_gpt_parameter && is_parameter_image(image) {
-                continue;
-            }
-            let line = write_firmware_image(&app, &mut device, image, flash_sectors).await?;
+            let target = firmware_write_target(image);
+            let line = write_firmware_image(&app, &mut device, &target, flash_sectors).await?;
             emit_log(&app, &line);
         }
 
@@ -1983,6 +2294,70 @@ mod tests {
                     transfer_len: 512,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn new_idblock_aligns_each_loader_component_to_four_sectors() {
+        let idblock = new_idblock(
+            vec![1; 512],
+            None,
+            vec![2; 513],
+            vec![3; 2048],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(idblock.len(), 2048 * 3);
+        assert_eq!(&idblock[..512], &[1; 512]);
+        assert_eq!(&idblock[2048..2048 + 513], &[2; 513]);
+        assert_eq!(&idblock[4096..4096 + 2048], &[3; 2048]);
+    }
+
+    #[test]
+    fn new_idblock_places_flash_boost_before_flash_data() {
+        let idblock = new_idblock(
+            vec![1; 512],
+            Some(vec![2; 512]),
+            vec![3; 512],
+            vec![4; 512],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(idblock.len(), 2048 * 4);
+        assert_eq!(&idblock[..512], &[1; 512]);
+        assert_eq!(&idblock[2048..2048 + 512], &[2; 512]);
+        assert_eq!(&idblock[4096..4096 + 512], &[3; 512]);
+        assert_eq!(&idblock[6144..6144 + 512], &[4; 512]);
+    }
+
+    #[test]
+    fn legacy_idblock_has_the_official_header_after_rc4_decoding() {
+        let mut idblock = legacy_idblock(vec![0x11; 512], vec![0x22; 512], false).unwrap();
+
+        rc4_crypt(&mut idblock[..SECTOR_SIZE]);
+        rc4_crypt(&mut idblock[SECTOR_SIZE * 2..SECTOR_SIZE * 3]);
+        assert_eq!(&idblock[..4], &0x0ff0_aa55u32.to_le_bytes());
+        assert_eq!(&idblock[506..508], &4u16.to_le_bytes());
+        assert_eq!(&idblock[508..510], &8u16.to_le_bytes());
+        assert_eq!(&idblock[SECTOR_SIZE * 4..SECTOR_SIZE * 5], &[0x11; 512]);
+        assert_eq!(&idblock[SECTOR_SIZE * 8..SECTOR_SIZE * 9], &[0x22; 512]);
+    }
+
+    #[test]
+    fn firmware_parameter_uses_rockchip_parameter_lba() {
+        let image = FirmwareImage {
+            name: "parameter".to_string(),
+            path: PathBuf::from("parameter.txt"),
+            flash_offset_sectors: 0,
+            flash_size_sectors: 0,
+            byte_count: 512,
+        };
+
+        assert_eq!(
+            firmware_write_target(&image).flash_offset_sectors,
+            FIRMWARE_PARAMETER_START_SECTOR
         );
     }
 

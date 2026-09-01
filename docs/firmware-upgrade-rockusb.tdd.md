@@ -4,8 +4,8 @@ Source plan: derived from the requested upgrade workflow in this task.
 
 ## User Journeys
 
-- A Maskrom user can select an RK3576 update image, upload its `MiniLoaderAll.bin` using RockUSB Boot, then write each partition through RockUSB LBA.
-- A Maskrom user can select an RV1106G3 update image, upload its `download.bin` using RockUSB Boot, then write each partition through RockUSB LBA.
+- A Maskrom user can select an RK3576 update image, upload its `MiniLoaderAll.bin` using RockUSB Boot, construct and persist its IDBlock through RockUSB, then write each partition through RockUSB LBA.
+- A Maskrom user can select an RV1106G3 update image, upload its `download.bin` using RockUSB Boot, construct and persist its IDBlock through RockUSB, then write each partition through RockUSB LBA.
 - An Android user can flash a `TYPE: GPT` firmware image so its partition table is created before its Android partition images are written.
 - An Android user can flash an Android sparse image so its logical output blocks, rather than sparse container bytes, are written.
 - A malformed firmware entry cannot write outside the temporary extraction directory or outside the target flash.
@@ -18,6 +18,8 @@ Source plan: derived from the requested upgrade workflow in this task.
 | Guarantee | Validation | Result |
 |---|---|---|
 | `download.bin` and `MiniLoaderAll.bin` are Loader names | `cargo test` | PASS |
+| Firmware Loader persistence builds Rockchip's IDBlock rather than copying the raw Loader file | Unit tests cover legacy, New IDBlock, and the RK3576 `FlashBoost` layout | PASS |
+| `TYPE: GPT` firmware writes both GPT tables and its packaged `parameter` block at Rockchip's LBA `0x2000` | `cargo test` plus RK3576 upgrade log | PASS |
 | LBA writes use 128-sector chunks and pad only the last sector | `cargo test` | PASS |
 | Entries with `flash_offset = 0xffffffff` are not LBA writes | `cargo test` | PASS |
 | Loader readiness is determined by a successful RockUSB flash probe, not displayed USB mode | `cargo test` | PASS |
