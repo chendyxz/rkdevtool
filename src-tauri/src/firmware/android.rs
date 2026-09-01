@@ -4,6 +4,7 @@ const GPT_ENTRY_COUNT: usize = 128;
 const GPT_ENTRY_SECTORS: u64 = (GPT_ENTRY_SIZE * GPT_ENTRY_COUNT / SECTOR_SIZE) as u64;
 const GPT_PRIMARY_SECTORS: u64 = 2 + GPT_ENTRY_SECTORS;
 const GPT_BACKUP_SECTORS: u64 = 1 + GPT_ENTRY_SECTORS;
+const ROCKCHIP_PARAMETER_MAGIC: &[u8; 4] = b"PARM";
 
 const BASIC_DATA_GUID: [u8; 16] = [
     0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44, 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7,
@@ -52,20 +53,50 @@ pub(crate) struct GptTables {
     pub backup: Vec<u8>,
 }
 
+fn parameter_payload(data: &[u8]) -> Result<&[u8], String> {
+    if !data.starts_with(ROCKCHIP_PARAMETER_MAGIC) {
+        return Ok(data);
+    }
+    if data.len() < 8 {
+        return Err("Incomplete Rockchip PARM header".to_string());
+    }
+
+    let payload_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let payload_end = 8usize
+        .checked_add(payload_len)
+        .ok_or_else(|| "Rockchip PARM payload length overflows".to_string())?;
+    if payload_end <= data.len() {
+        return Ok(&data[8..payload_end]);
+    }
+
+    // Older raw parameter inputs use PARM as a NUL-terminated marker rather than a
+    // length-prefixed header. Keep accepting that representation.
+    if data[4] == 0 && data[5..8].iter().all(u8::is_ascii_uppercase) {
+        return Ok(data);
+    }
+
+    Err(format!(
+        "Rockchip PARM payload length {payload_len} exceeds available data ({})",
+        data.len() - 8
+    ))
+}
+
 pub(crate) fn parse_gpt_parameter(data: &[u8]) -> Result<Option<Vec<GptPartition>>, String> {
-    let text = String::from_utf8_lossy(data);
+    let payload = parameter_payload(data)?;
+    let text = String::from_utf8_lossy(payload);
     if !text.contains("TYPE: GPT") {
         return Ok(None);
     }
 
-    parse_parameter_partitions(data)?
+    parse_parameter_partitions(payload)?
         .ok_or_else(|| "GPT parameter has no CMDLINE".to_string())
         .map(Some)
 }
 
 /// Parse Rockchip's mtdparts command line from either a legacy or GPT parameter image.
 pub(crate) fn parse_parameter_partitions(data: &[u8]) -> Result<Option<Vec<GptPartition>>, String> {
-    let text = String::from_utf8_lossy(data);
+    let payload = parameter_payload(data)?;
+    let text = String::from_utf8_lossy(payload);
     let Some(cmdline_start) = text.find("CMDLINE:") else {
         return Ok(None);
     };
@@ -487,6 +518,39 @@ mod tests {
                 0x00, 0x00, 0x4e, 0x61, 0x00, 0x00, 0x53, 0x4b, 0x80, 0x00, 0x1d, 0x28, 0x00, 0x00,
                 0x54, 0xa9
             ]
+        );
+    }
+
+    #[test]
+    fn parm_payload_length_excludes_binary_data_after_final_uuid() {
+        let payload = b"TYPE: GPT\0CMDLINE:mtdparts=rk29xxnand:0x00020000@0x00008000(boot),0x00c00000@0x00078000(rootfs)\nuuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9";
+        let mut parameter = b"PARM".to_vec();
+        parameter.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        parameter.extend_from_slice(payload);
+        parameter.extend_from_slice(&[0xd7, 0xbb, 0xf9, 0xa7]);
+
+        let partitions = parse_gpt_parameter(&parameter).unwrap().unwrap();
+        let rootfs = partitions
+            .iter()
+            .find(|partition| partition.name == "rootfs")
+            .unwrap();
+
+        assert_eq!(
+            rootfs.unique_guid,
+            Some([
+                0x00, 0x00, 0x4e, 0x61, 0x00, 0x00, 0x53, 0x4b, 0x80, 0x00, 0x1d, 0x28, 0x00, 0x00,
+                0x54, 0xa9,
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_parm_payload() {
+        let parameter = b"PARM\x20\x00\x00\x00TYPE: GPT";
+
+        assert_eq!(
+            parse_gpt_parameter(parameter).unwrap_err(),
+            "Rockchip PARM payload length 32 exceeds available data (9)"
         );
     }
 

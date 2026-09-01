@@ -25,6 +25,7 @@ Source plan: derived from the requested upgrade workflow in this task.
 | `TYPE: GPT` parameter files produce valid primary and backup GPT data before partition writes | `cargo test` | PASS |
 | A `grow` partition spans from its declared start sector through the final usable GPT sector | `cargo test` | PASS |
 | Binary bytes following the final GPT parameter entry do not invalidate the partition table | `cargo test` | PASS |
+| Length-prefixed `PARM` payloads exclude trailing binary data even when the final UUID has no line terminator | `cargo test parm_payload_length_excludes_binary_data_after_final_uuid` | PASS |
 | Android sparse raw, fill, and hole chunks are parsed into their logical block output | `cargo test` | PASS |
 | Android sparse `DONT_CARE` chunks advance the logical image offset without a USB write | `cargo test` | PASS |
 | Firmware progress emits at most once per integer percentage point | `cargo test` | PASS |
