@@ -53,6 +53,17 @@ const PARAMETER_READ_SECTORS: u32 = 128;
 const FIRMWARE_PARAMETER_START_SECTOR: u64 = 0x2000;
 const IDBLOCK_START_SECTOR: u32 = 0x40;
 const IDBLOCK_ALIGNMENT: usize = 2048;
+/// Raw NAND pages carry a 512-byte logical sector plus 16 bytes of OOB data.
+const NAND_RAW_SECTOR_SIZE: usize = 528;
+/// rkdeveloptool reserves the first 50 physical NAND blocks for the Loader.
+const NAND_IDBLOCK_RESERVED_BLOCKS: u32 = 50;
+/// upgrade_tool `WriteIDBlock` persists five independently verified copies.
+const NAND_IDBLOCK_COPIES: u32 = 5;
+/// Some USB plug loaders, including RK3506's, expose only the first 0x800 raw
+/// sectors to `WriteSector`. Keep every verified IDBlock copy within that window.
+const NAND_IDBLOCK_RAW_WRITE_SECTOR_LIMIT: u32 = 0x800;
+/// Match upgrade_tool's IDBlock raw-sector write batches.
+const NAND_IDBLOCK_WRITE_PAGES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DownloadPartition {
@@ -1036,19 +1047,27 @@ async fn write_loader_idblock(
     app: &AppHandle,
     device: &mut Device,
     loader_path: &Path,
-    flash_sectors: u32,
+    flash_info: &FlashInfo,
 ) -> Result<(), String> {
     let capability = device
         .capability()
         .await
         .map_err(|e| format!("Read Loader capability failed: {e}"))?;
     let (idblock, layout) = build_loader_idblock(loader_path, &capability)?;
+    let storage = device
+        .storage()
+        .await
+        .map_err(|e| format!("Read Loader storage type failed: {e}"))?;
+    if is_raw_nand_storage(storage) {
+        return write_nand_loader_idblock(app, device, &idblock, layout, flash_info).await;
+    }
+
     let sectors = u32::try_from(idblock.len() / SECTOR_SIZE)
         .map_err(|_| "Loader IDBlock is too large".to_string())?;
     let end_sector = IDBLOCK_START_SECTOR
         .checked_add(sectors)
         .ok_or_else(|| "Loader IDBlock range overflows".to_string())?;
-    if end_sector > flash_sectors {
+    if end_sector > flash_info.sectors() {
         return Err("Loader IDBlock exceeds the target flash size".to_string());
     }
     emit_log(
@@ -1090,6 +1109,283 @@ async fn write_loader_idblock(
         }
     }
     emit_log(app, &format!("Written Loader ({layout}) successfully"));
+    Ok(())
+}
+
+fn is_raw_nand_storage(storage: StorageIndex) -> bool {
+    matches!(
+        storage,
+        StorageIndex::Nand
+            | StorageIndex::MtdBlkNand
+            | StorageIndex::SpiNand
+            | StorageIndex::MtdBlkSpiNand
+    )
+}
+
+fn nand_page_ecc(data_and_oob_header: &[u8]) -> [u8; 13] {
+    debug_assert_eq!(data_and_oob_header.len(), SECTOR_SIZE + 3);
+
+    const FEEDBACK: [u32; 4] = [0x4c3d_56ac, 0x97dc_b25b, 0x6ac1_0939, 0x0000_000b];
+    let mut state = [0u32; 4];
+    for byte in data_and_oob_header {
+        for bit_index in 0..8 {
+            let bit = ((u32::from(*byte) >> bit_index) ^ state[0]) & 1;
+            let previous = state;
+            state[0] = ((previous[0] >> 1) | (previous[1] << 31)) ^ (bit * FEEDBACK[0]);
+            state[1] = ((previous[1] >> 1) | (previous[2] << 31)) ^ (bit * FEEDBACK[1]);
+            state[2] = ((previous[2] >> 1) | (previous[3] << 31)) ^ (bit * FEEDBACK[2]);
+            state[3] = ((previous[3] >> 1) ^ (bit * FEEDBACK[3])) | (bit << 7);
+        }
+    }
+
+    state[0] ^= 0x529d_8c4e;
+    state[1] ^= 0xcb7c_6c2d;
+    state[2] ^= 0x1914_12c3;
+    state[3] ^= 0x37;
+
+    let mut ecc = [0u8; 13];
+    ecc[..4].copy_from_slice(&state[0].to_le_bytes());
+    ecc[4..8].copy_from_slice(&state[1].to_le_bytes());
+    ecc[8..12].copy_from_slice(&state[2].to_le_bytes());
+    ecc[12] = state[3] as u8;
+    ecc
+}
+
+fn make_nand_idblock_pages(idblock: &[u8]) -> Result<Vec<u8>, String> {
+    if idblock.is_empty() || idblock.len() % SECTOR_SIZE != 0 {
+        return Err("Loader IDBlock must contain complete 512-byte sectors".to_string());
+    }
+
+    let page_count = idblock.len() / SECTOR_SIZE;
+    let raw_size = page_count
+        .checked_mul(NAND_RAW_SECTOR_SIZE)
+        .ok_or_else(|| "Loader IDBlock is too large for raw NAND pages".to_string())?;
+    let mut pages = vec![0xff; raw_size];
+    for (page_index, (source, page)) in idblock
+        .chunks_exact(SECTOR_SIZE)
+        .zip(pages.chunks_exact_mut(NAND_RAW_SECTOR_SIZE))
+        .enumerate()
+    {
+        page[..SECTOR_SIZE].copy_from_slice(source);
+        page[SECTOR_SIZE..SECTOR_SIZE + 2].copy_from_slice(&[0xff, 0xff]);
+        page[SECTOR_SIZE + 2] = if page_index == 0 { 0x69 } else { 0xff };
+        let ecc = nand_page_ecc(&page[..SECTOR_SIZE + 3]);
+        page[SECTOR_SIZE + 3..].copy_from_slice(&ecc);
+    }
+    Ok(pages)
+}
+
+fn nand_idblock_copy_count(block_size: u32, blocks_per_copy: u32) -> u32 {
+    let sectors_per_copy = block_size.saturating_mul(blocks_per_copy);
+    if sectors_per_copy == 0 {
+        return 0;
+    }
+    (NAND_IDBLOCK_RAW_WRITE_SECTOR_LIMIT / sectors_per_copy)
+        .min(NAND_IDBLOCK_COPIES)
+}
+
+async fn write_nand_loader_idblock(
+    app: &AppHandle,
+    device: &mut Device,
+    idblock: &[u8],
+    layout: &str,
+    flash_info: &FlashInfo,
+) -> Result<(), String> {
+    let block_size = u32::from(flash_info.block_size_sectors());
+    if block_size == 0 {
+        return Err("Flash reports block size 0 for raw NAND Loader write".to_string());
+    }
+    let raw_pages = make_nand_idblock_pages(idblock)?;
+    let page_count = u32::try_from(raw_pages.len() / NAND_RAW_SECTOR_SIZE)
+        .map_err(|_| "Loader IDBlock is too large".to_string())?;
+    let required_blocks = page_count.div_ceil(block_size);
+    let copy_count = nand_idblock_copy_count(block_size, required_blocks);
+    if copy_count == 0 {
+        return Err(format!(
+            "Loader IDBlock needs {required_blocks} raw NAND blocks, exceeding the Loader raw-write window"
+        ));
+    }
+    let total_blocks = flash_info.sectors() / block_size;
+    let reservation_blocks = total_blocks.min(NAND_IDBLOCK_RESERVED_BLOCKS);
+    if required_blocks == 0 || required_blocks > reservation_blocks {
+        return Err(format!(
+            "Loader IDBlock needs {required_blocks} raw NAND blocks, but only {reservation_blocks} reserved blocks are available"
+        ));
+    }
+
+    emit_log(
+        app,
+        &format!(
+            "Writing Loader ({layout}) to raw NAND: {} pages, {required_blocks} block(s) per copy, {copy_count} copies in physical blocks 0-{}",
+            page_count,
+            reservation_blocks - 1,
+        ),
+    );
+    if copy_count < NAND_IDBLOCK_COPIES {
+        emit_log(
+            app,
+            &format!(
+                "Limiting Loader copies to {copy_count}: this Loader accepts raw writes only below sector 0x{NAND_IDBLOCK_RAW_WRITE_SECTOR_LIMIT:x}"
+            ),
+        );
+    }
+
+    let last_candidate = (reservation_blocks - required_blocks).min(
+        NAND_IDBLOCK_RAW_WRITE_SECTOR_LIMIT
+            .saturating_sub(page_count)
+            / block_size,
+    );
+    let mut candidate_block = 0;
+    for copy_index in 1..=copy_count {
+        let first_block = loop {
+            if candidate_block > last_candidate {
+                return Err(format!(
+                    "Only {} of {copy_count} Loader IDBlock copies fit in the first {reservation_blocks} raw NAND blocks",
+                    copy_index - 1
+                ));
+            }
+            let first_block = candidate_block;
+            match write_nand_loader_idblock_copy(
+                app,
+                device,
+                &raw_pages,
+                page_count,
+                layout,
+                copy_index,
+                copy_count,
+                first_block,
+                required_blocks,
+                block_size,
+            )
+            .await
+            {
+                Ok(()) => {
+                    candidate_block = first_block + required_blocks;
+                    break first_block;
+                }
+                Err(error) => {
+                    emit_log(
+                        app,
+                        &format!(
+                            "Loader ({layout}) copy {copy_index}/{copy_count} at raw NAND block {first_block} failed: {error}; trying later blocks"
+                        ),
+                    );
+                    candidate_block = first_block + 1;
+                }
+            }
+        };
+
+        emit_log(
+            app,
+            &format!(
+                "Written Loader ({layout}) copy {copy_index}/{copy_count} to raw NAND block{} {first_block}-{}",
+                if required_blocks == 1 { "" } else { "s" },
+                first_block + required_blocks - 1
+            ),
+        );
+    }
+    emit_log(
+        app,
+        &format!(
+            "Written all {copy_count} Loader ({layout}) copies successfully"
+        ),
+    );
+    Ok(())
+}
+
+async fn write_nand_loader_idblock_copy(
+    app: &AppHandle,
+    device: &mut Device,
+    raw_pages: &[u8],
+    page_count: u32,
+    layout: &str,
+    copy_index: u32,
+    copy_count: u32,
+    first_block: u32,
+    block_count: u32,
+    block_size: u32,
+) -> Result<(), String> {
+    emit_log(
+        app,
+        &format!(
+            "Writing Loader ({layout}) copy {copy_index}/{copy_count}: raw NAND block{} {first_block}-{}",
+            if block_count == 1 { "" } else { "s" },
+            first_block + block_count - 1
+        ),
+    );
+    device
+        .erase_block(0, first_block, block_count as u16, false)
+        .await
+        .map_err(|error| format!("erase failed: {error}"))?;
+
+    let first_sector = first_block
+        .checked_mul(block_size)
+        .ok_or_else(|| "Raw NAND Loader start sector overflows".to_string())?;
+    let mut completed = 0usize;
+    let mut last_progress_percent = None;
+    for (page_offset, chunk) in raw_pages
+        .chunks(NAND_IDBLOCK_WRITE_PAGES * NAND_RAW_SECTOR_SIZE)
+        .enumerate()
+    {
+        let pages_in_chunk = chunk.len() / NAND_RAW_SECTOR_SIZE;
+        let sector = first_sector
+            .checked_add((page_offset * NAND_IDBLOCK_WRITE_PAGES) as u32)
+            .ok_or_else(|| "Raw NAND Loader sector address overflows".to_string())?;
+        let transferred = device
+            .write_sector(0, sector, chunk)
+            .await
+            .map_err(|error| format!("write at sector {sector} failed: {error}"))?;
+        if transferred as usize != chunk.len() {
+            return Err(format!(
+                "short write at sector {sector}: got {transferred} bytes, expected {}",
+                chunk.len()
+            ));
+        }
+
+        let mut readback = vec![0u8; chunk.len()];
+        let transferred = device
+            .read_sector(0, sector, &mut readback)
+            .await
+            .map_err(|error| format!("readback at sector {sector} failed: {error}"))?;
+        if transferred as usize != readback.len() {
+            return Err(format!(
+                "short readback at sector {sector}: got {transferred} bytes, expected {}",
+                readback.len()
+            ));
+        }
+        if let Some((page, actual, expected)) = readback
+            .chunks_exact(NAND_RAW_SECTOR_SIZE)
+            .zip(chunk.chunks_exact(NAND_RAW_SECTOR_SIZE))
+            .enumerate()
+            .find_map(|(page, (actual, expected))| {
+                (actual[..SECTOR_SIZE] != expected[..SECTOR_SIZE]).then_some((page, actual, expected))
+            })
+        {
+            let byte = actual[..SECTOR_SIZE]
+                .iter()
+                .zip(&expected[..SECTOR_SIZE])
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or_default();
+            return Err(format!(
+                "data verification failed at sector {} (page {page}, byte {byte}: read 0x{:02x}, expected 0x{:02x})",
+                sector + page as u32,
+                actual[byte],
+                expected[byte],
+            ));
+        }
+
+        completed += pages_in_chunk;
+        let percent = (completed as u64 * 100) / u64::from(page_count);
+        if should_emit_progress(last_progress_percent, percent) {
+            emit_progress(
+                app,
+                format!(
+                    "Writing Loader ({layout}) copy {copy_index}/{copy_count}... {completed}/{page_count} raw pages ({percent}%)"
+                ),
+            );
+            last_progress_percent = Some(percent);
+        }
+    }
     Ok(())
 }
 
@@ -1659,7 +1955,7 @@ pub async fn upgrade_firmware(
         }
 
         if let Some(loader_path) = firmware.loader_path.as_deref() {
-            write_loader_idblock(&app, &mut device, loader_path, flash_sectors).await?;
+            write_loader_idblock(&app, &mut device, loader_path, &flash_info).await?;
         }
 
         let gpt_tables = gpt_tables_for_firmware(&firmware.images, flash_sectors)?;
@@ -1667,8 +1963,38 @@ pub async fn upgrade_firmware(
             write_gpt_tables(&app, &mut device, tables).await?;
         }
 
+        let ubi_erase_plan = match device.storage().await {
+            Ok(storage) if is_raw_nand_storage(storage) => ubi_preflash_erase_plan(
+                &firmware.images,
+                u32::from(flash_info.block_size_sectors()),
+                flash_sectors,
+                gpt_tables.as_ref().map(|tables| tables.backup_start_sector),
+            )?,
+            Ok(_) => Vec::new(),
+            Err(error) => {
+                emit_log(
+                    &app,
+                    &format!("Skipping NAND data partition erase: storage type unavailable ({error})"),
+                );
+                Vec::new()
+            }
+        };
+
         for image in &firmware.images {
             let target = firmware_write_target(image);
+            if let Some(range) = ubi_erase_plan
+                .iter()
+                .find(|range| target.flash_offset_sectors == range.start_sector)
+            {
+                erase_ubi_partition_range(
+                    &app,
+                    &mut device,
+                    &target.name,
+                    range.start_block,
+                    range.block_count,
+                )
+                .await?;
+            }
             let line = write_firmware_image(&app, &mut device, &target, flash_sectors).await?;
             emit_log(&app, &line);
         }
@@ -1989,6 +2315,149 @@ fn flash_block_count(info: &FlashInfo) -> Result<u32, String> {
         return Err("Flash reports 0 sectors".to_string());
     }
     Ok(sectors / block_size)
+}
+
+/// UBI's erase counter header begins each raw UBIFS image. This matches
+/// rkdeveloptool's `is_ubifs_image` detection without relying on a partition name.
+const UBI_EC_HEADER_MAGIC: [u8; 4] = *b"UBI#";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UbiPreflashEraseRange {
+    start_sector: u64,
+    start_block: u32,
+    block_count: u32,
+}
+
+fn image_has_ubi_ec_header(image: &FirmwareImage) -> Result<bool, String> {
+    let mut header = [0u8; UBI_EC_HEADER_MAGIC.len()];
+    let mut file = File::open(&image.path)
+        .map_err(|error| format!("Open {} for UBI detection failed: {error}", image.path.display()))?;
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(header == UBI_EC_HEADER_MAGIC),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(format!(
+            "Read {} for UBI detection failed: {error}",
+            image.path.display()
+        )),
+    }
+}
+
+fn ubi_preflash_erase_plan(
+    images: &[FirmwareImage],
+    erase_block_sectors: u32,
+    flash_sectors: u32,
+    backup_gpt_start_sector: Option<u32>,
+) -> Result<Vec<UbiPreflashEraseRange>, String> {
+    if erase_block_sectors == 0 {
+        return Err("Flash reports erase block size 0".to_string());
+    }
+    if flash_sectors == 0 {
+        return Err("Flash reports 0 sectors".to_string());
+    }
+
+    let mut image_starts: Vec<u64> = images
+        .iter()
+        .map(|image| image.flash_offset_sectors)
+        .collect();
+    image_starts.sort_unstable();
+    image_starts.dedup();
+
+    let backup_gpt_start_sector = backup_gpt_start_sector.map(u64::from);
+    let mut plan = Vec::new();
+    for image in images {
+        if !image_has_ubi_ec_header(image)? {
+            continue;
+        }
+        let start = image.flash_offset_sectors;
+        let image_end = if image.flash_size_sectors > 0 {
+            Some(
+                start
+                    .checked_add(image.flash_size_sectors)
+                    .ok_or_else(|| format!("{} partition range overflows", image.name))?,
+            )
+        } else {
+            None
+        };
+        let next_image_start = image_starts.iter().copied().find(|&next| next > start);
+        let end = [image_end, next_image_start, backup_gpt_start_sector]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(end) = end else {
+            // A partial firmware package without any safe upper boundary must
+            // not erase to the end of the device and overwrite the backup GPT.
+            continue;
+        };
+        if end > u64::from(flash_sectors) {
+            return Err(format!(
+                "{} partition erase range exceeds flash size",
+                image.name
+            ));
+        }
+        if end <= start {
+            return Err(format!("{} partition erase range is empty", image.name));
+        }
+        if start % u64::from(erase_block_sectors) != 0 {
+            return Err(format!(
+                "{} partition erase start is not erase-block aligned",
+                image.name
+            ));
+        }
+
+        let start_block = start / u64::from(erase_block_sectors);
+        let end_block = end / u64::from(erase_block_sectors);
+        if end_block <= start_block {
+            continue;
+        }
+        let start_block = u32::try_from(start_block)
+            .map_err(|_| "Image region exceeds RockUSB range".to_string())?;
+        let block_count = u32::try_from(end_block - u64::from(start_block))
+            .map_err(|_| "Image region exceeds RockUSB range".to_string())?;
+        plan.push(UbiPreflashEraseRange {
+            start_sector: start,
+            start_block,
+            block_count,
+        });
+    }
+    plan.sort_unstable_by_key(|range| range.start_sector);
+    plan.dedup_by_key(|range| range.start_sector);
+    Ok(plan)
+}
+
+async fn erase_ubi_partition_range(
+    app: &AppHandle,
+    device: &mut Device,
+    name: &str,
+    start_block: u32,
+    block_count: u32,
+) -> Result<(), String> {
+    let chunks = erase_block_chunks(block_count)?;
+    emit_log(
+        app,
+        &format!(
+            "Erasing {name} partition: blocks 0x{start_block:x}-0x{:x} ({block_count} blocks)",
+            start_block + block_count - 1
+        ),
+    );
+    let total = chunks.len();
+    for (index, (offset, count)) in chunks.into_iter().enumerate() {
+        device
+            .erase_force(start_block + offset, count)
+            .await
+            .map_err(|e| format!("Erase {name} block {} failed: {e}", start_block + offset))?;
+        if (index + 1) % 8 == 0 || index + 1 == total {
+            emit_progress(
+                app,
+                format!(
+                    "Erasing {name} partition... {}/{} blocks",
+                    offset + u32::from(count),
+                    block_count
+                ),
+            );
+        }
+    }
+    emit_log(app, &format!("Erased {name} partition successfully"));
+    Ok(())
 }
 
 /// Erase entire flash (upgrade_tool `EF` / rkdeveloptool `ef` / `EraseAllBlocks`).
@@ -2346,6 +2815,54 @@ mod tests {
     }
 
     #[test]
+    fn nand_page_ecc_matches_upgrade_tool() {
+        let mut data_and_oob_header = [0xff; SECTOR_SIZE + 3];
+        data_and_oob_header[SECTOR_SIZE + 2] = 0x69;
+
+        assert_eq!(
+            nand_page_ecc(&data_and_oob_header),
+            [
+                0x46, 0x4b, 0xb0, 0xee, 0x89, 0x31, 0xf0, 0x1e, 0x0e, 0x77, 0x62, 0x3c,
+                0xbc,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_nand_idblock_copy_count_respects_loader_write_window() {
+        // RK3506's 256-sector erase blocks place copy 5 at raw sector 0x800,
+        // where its USB plug loader no longer accepts WriteSector requests.
+        assert_eq!(nand_idblock_copy_count(256, 2), 4);
+        assert_eq!(nand_idblock_copy_count(128, 2), 5);
+    }
+
+    #[test]
+    fn nand_idblock_pages_include_oob_and_ecc() {
+        let pages = make_nand_idblock_pages(&[0xff; SECTOR_SIZE * 2]).unwrap();
+        assert_eq!(pages.len(), NAND_RAW_SECTOR_SIZE * 2);
+        assert_eq!(&pages[..SECTOR_SIZE], &[0xff; SECTOR_SIZE]);
+        assert_eq!(&pages[SECTOR_SIZE..SECTOR_SIZE + 3], &[0xff, 0xff, 0x69]);
+        assert_eq!(
+            &pages[SECTOR_SIZE + 3..NAND_RAW_SECTOR_SIZE],
+            &[0x46, 0x4b, 0xb0, 0xee, 0x89, 0x31, 0xf0, 0x1e, 0x0e, 0x77, 0x62, 0x3c, 0xbc]
+        );
+        assert_eq!(
+            &pages[NAND_RAW_SECTOR_SIZE + SECTOR_SIZE..NAND_RAW_SECTOR_SIZE + SECTOR_SIZE + 3],
+            &[0xff, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn raw_nand_storage_types_use_physical_idblock_writes() {
+        assert!(is_raw_nand_storage(StorageIndex::Nand));
+        assert!(is_raw_nand_storage(StorageIndex::MtdBlkNand));
+        assert!(is_raw_nand_storage(StorageIndex::SpiNand));
+        assert!(is_raw_nand_storage(StorageIndex::MtdBlkSpiNand));
+        assert!(!is_raw_nand_storage(StorageIndex::Emmc));
+        assert!(!is_raw_nand_storage(StorageIndex::SpiNor));
+    }
+
+    #[test]
     fn firmware_parameter_uses_rockchip_parameter_lba() {
         let image = FirmwareImage {
             name: "parameter".to_string(),
@@ -2448,6 +2965,95 @@ mod tests {
         raw[4..6].copy_from_slice(&256u16.to_le_bytes()); // block size in sectors (128KiB)
         let info = FlashInfo::from_bytes(raw);
         assert_eq!(flash_block_count(&info).unwrap(), 2048);
+    }
+
+    fn firmware_image(name: &str, start: u64, size: u64, is_ubi: bool) -> FirmwareImage {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rkdevtool-{name}-{}-{unique}.img",
+            std::process::id()
+        ));
+        let header = if is_ubi { UBI_EC_HEADER_MAGIC } else { *b"raw!" };
+        std::fs::write(&path, header).unwrap();
+        FirmwareImage {
+            name: name.to_string(),
+            path,
+            flash_offset_sectors: start,
+            flash_size_sectors: size,
+            byte_count: 0,
+        }
+    }
+
+    fn remove_test_images(images: &[FirmwareImage]) {
+        for image in images {
+            let _ = std::fs::remove_file(&image.path);
+        }
+    }
+
+    #[test]
+    fn ubi_preflash_erase_plan_is_bounded_by_following_images_and_backup_gpt() {
+        let images = vec![
+            firmware_image("project-volume", 0x1a800, 0x50000, true),
+            firmware_image("factory-data", 0x6a800, 0x8000, true),
+            firmware_image("client-storage", 0x72800, 0, true),
+        ];
+
+        let plan = ubi_preflash_erase_plan(&images, 256, 523_264, Some(523_231)).unwrap();
+        assert_eq!(
+            plan,
+            [
+                UbiPreflashEraseRange {
+                    start_sector: 0x1a800,
+                    start_block: 0x1a8,
+                    block_count: 1280,
+                },
+                UbiPreflashEraseRange {
+                    start_sector: 0x6a800,
+                    start_block: 0x6a8,
+                    block_count: 128,
+                },
+                UbiPreflashEraseRange {
+                    start_sector: 0x72800,
+                    start_block: 0x728,
+                    block_count: 211,
+                },
+            ]
+        );
+        remove_test_images(&images);
+    }
+
+    #[test]
+    fn ubi_preflash_erase_plan_never_guesses_an_unbounded_tail() {
+        let images = vec![firmware_image("custom-volume", 0x72800, 0, true)];
+
+        let plan = ubi_preflash_erase_plan(&images, 256, 523_264, None).unwrap();
+        assert!(plan.is_empty());
+        remove_test_images(&images);
+    }
+
+    #[test]
+    fn ubi_preflash_erase_plan_requires_block_aligned_start() {
+        let images = vec![firmware_image("custom-volume", 0x180, 0x100, true)];
+
+        let result = ubi_preflash_erase_plan(&images, 0x100, 0x800, None);
+        assert!(result.is_err());
+        remove_test_images(&images);
+    }
+
+    #[test]
+    fn ubi_preflash_erase_plan_uses_image_header_not_partition_name() {
+        let images = vec![
+            firmware_image("rootfs", 0x100, 0x100, false),
+            firmware_image("custom-volume", 0x200, 0x100, true),
+        ];
+
+        let plan = ubi_preflash_erase_plan(&images, 0x100, 0x800, None).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].start_sector, 0x200);
+        remove_test_images(&images);
     }
 
     #[test]
