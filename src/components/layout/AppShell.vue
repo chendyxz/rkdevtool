@@ -8,6 +8,7 @@ import StatusBar from "./StatusBar.vue";
 import PageHeader from "./PageHeader.vue";
 import DownloadPage from "../pages/DownloadPage.vue";
 import UpgradePage from "../pages/UpgradePage.vue";
+import ApkUpdatePage from "../pages/ApkUpdatePage.vue";
 import AdvancedPage from "../pages/AdvancedPage.vue";
 import { useI18n } from "../../i18n";
 
@@ -25,6 +26,8 @@ const pageTitle = computed(() => {
       return t("page.upgrade");
     case "advanced":
       return t("page.advanced");
+    case "apk-update":
+      return t("page.apkUpdate");
   }
 });
 </script>
@@ -39,6 +42,7 @@ const pageTitle = computed(() => {
         <div class="left-panel">
           <DownloadPage v-if="activePage === 'download'" />
           <UpgradePage v-else-if="activePage === 'upgrade'" />
+          <ApkUpdatePage v-else-if="activePage === 'apk-update'" />
           <AdvancedPage v-else />
         </div>
       </div>

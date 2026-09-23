@@ -1,4 +1,4 @@
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 
 function pickFileViaInput(): Promise<string | null> {
   return new Promise((resolve) => {
@@ -17,6 +17,11 @@ function pickFileViaInput(): Promise<string | null> {
     document.body.appendChild(input);
     input.click();
   });
+}
+
+export async function pickSavePath(title?: string, defaultPath?: string): Promise<string | null> {
+  const selected = await save({ title, defaultPath, filters: [{ name: "Rockchip firmware", extensions: ["img"] }] });
+  return typeof selected === "string" ? selected : null;
 }
 
 export async function pickFile(title?: string): Promise<string | null> {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 import AppButton from "../ui/AppButton.vue";
 import PathField from "../ui/PathField.vue";
 import { useAppState } from "../../composables/useAppState";
@@ -12,10 +12,15 @@ const { appendLog, busy, deviceState } = useAppState();
 const { run } = useToolCommand();
 const { t } = useI18n();
 
-const firmwarePath = ref("");
+const UPGRADE_CONFIG_KEY = "rkdevtool.upgrade-config.v1";
+const firmwarePath = ref(localStorage.getItem(UPGRADE_CONFIG_KEY) ?? "");
 const firmwareVersion = ref("");
 const loaderVersion = ref("");
 const chipInfo = ref("");
+
+watch(firmwarePath, (path) => {
+  localStorage.setItem(UPGRADE_CONFIG_KEY, path);
+}, { flush: "sync" });
 
 async function refreshFirmwareInfo() {
   const path = firmwarePath.value.trim();
@@ -77,6 +82,7 @@ async function upgrade() {
 }
 
 onMounted(() => {
+  if (firmwarePath.value) void refreshFirmwareInfo();
   if (deviceState.value === "loader") {
     refreshChipInfo();
   } else {

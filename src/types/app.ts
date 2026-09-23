@@ -1,4 +1,4 @@
-export type PageId = "download" | "upgrade" | "advanced";
+export type PageId = "download" | "upgrade" | "apk-update" | "advanced";
 
 export type LogLevel = "default" | "info" | "success" | "error";
 
@@ -28,4 +28,4 @@ export interface PartitionRow {
   path: string;
 }
 
-export type DeviceState = "connected" | "disconnected" | "loader";
+export type DeviceState = "adb" | "connected" | "disconnected" | "loader";

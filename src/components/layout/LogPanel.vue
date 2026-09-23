@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { useAppState } from "../../composables/useAppState";
 import { useI18n } from "../../i18n";
 
@@ -8,6 +8,13 @@ const { t } = useI18n();
 
 const contentRef = ref<HTMLElement | null>(null);
 const stickToBottom = ref(true);
+const LOG_WIDTH_KEY = "rkdevtool.log-panel-width.v1";
+const LOG_WRAP_KEY = "rkdevtool.log-wrap.v1";
+const savedWidth = Number(localStorage.getItem(LOG_WIDTH_KEY));
+const panelWidth = ref(Number.isFinite(savedWidth) && savedWidth >= 260 ? savedWidth : 360);
+const wrapLines = ref(localStorage.getItem(LOG_WRAP_KEY) === "true");
+let resizeStartX = 0;
+let resizeStartWidth = 0;
 
 const levelClass = computed(() => (level: string) => `log-line--${level}`);
 
@@ -36,15 +43,53 @@ function handleClear() {
   stickToBottom.value = true;
   scrollToBottom();
 }
+
+function toggleWrap() {
+  wrapLines.value = !wrapLines.value;
+  localStorage.setItem(LOG_WRAP_KEY, String(wrapLines.value));
+}
+
+function clampWidth(width: number) {
+  return Math.max(260, Math.min(width, window.innerWidth * 0.75));
+}
+
+function onResize(event: PointerEvent) {
+  panelWidth.value = clampWidth(resizeStartWidth + resizeStartX - event.clientX);
+}
+
+function stopResize() {
+  window.removeEventListener("pointermove", onResize);
+  window.removeEventListener("pointerup", stopResize);
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+  localStorage.setItem(LOG_WIDTH_KEY, String(Math.round(panelWidth.value)));
+}
+
+function startResize(event: PointerEvent) {
+  resizeStartX = event.clientX;
+  resizeStartWidth = panelWidth.value;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  window.addEventListener("pointermove", onResize);
+  window.addEventListener("pointerup", stopResize);
+}
+
+onUnmounted(stopResize);
 </script>
 
 <template>
-  <aside class="log-panel">
+  <aside class="log-panel" :style="{ width: `${panelWidth}px`, flexBasis: `${panelWidth}px` }">
+    <div class="log-panel__resize" @pointerdown="startResize" />
     <header class="log-panel__header">
       <span>{{ t("log.title") }}</span>
-      <button type="button" class="log-panel__clear" @click="handleClear">{{ t("log.clear") }}</button>
+      <div class="log-panel__actions">
+        <button type="button" class="log-panel__clear" :class="{ 'log-panel__button--active': wrapLines }" @click="toggleWrap">
+          {{ wrapLines ? t("log.noWrap") : t("log.wrap") }}
+        </button>
+        <button type="button" class="log-panel__clear" @click="handleClear">{{ t("log.clear") }}</button>
+      </div>
     </header>
-    <div ref="contentRef" class="log-panel__content" @scroll="onScroll">
+    <div ref="contentRef" class="log-panel__content" :class="{ 'log-panel__content--wrap': wrapLines }" @scroll="onScroll">
       <p
         v-for="entry in logs"
         :key="entry.id"
@@ -59,15 +104,28 @@ function handleClear() {
 
 <style scoped>
 .log-panel {
-  flex: 0 1 var(--log-panel-width);
-  width: var(--log-panel-width);
-  min-width: var(--log-panel-min-width);
-  max-width: var(--log-panel-max-width);
+  position: relative;
+  flex: 0 0 360px;
+  min-width: 260px;
   min-height: 0;
   align-self: stretch;
   background: var(--color-log-bg);
   display: flex;
   flex-direction: column;
+}
+
+.log-panel__resize {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  cursor: col-resize;
+}
+
+.log-panel__resize:hover {
+  background: rgba(59, 130, 246, 0.45);
 }
 
 .log-panel__header {
@@ -95,6 +153,16 @@ function handleClear() {
 .log-panel__clear:hover {
   color: #e2e8f0;
   background: rgba(255, 255, 255, 0.06);
+}
+
+.log-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.log-panel__button--active {
+  color: #60a5fa;
 }
 
 .log-panel__content {
@@ -158,5 +226,12 @@ function handleClear() {
 
 .log-line--error {
   color: #f87171;
+}
+
+.log-panel__content--wrap .log-line,
+.log-panel__content--wrap .log-line--progress {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 </style>

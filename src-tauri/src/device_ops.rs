@@ -2047,6 +2047,18 @@ async fn switch_download_storage(
 ) -> Result<(), String> {
     let no = storage_name_to_ui_no(storage)?;
     let target = storage_from_ui_no(no)?;
+    if let Ok(current) = device.storage().await {
+        if !storage_switch_needed(current, target) {
+            emit_log(
+                app,
+                &format!(
+                    "Storage is already {}; skipping switch",
+                    storage.trim().to_ascii_uppercase()
+                ),
+            );
+            return Ok(());
+        }
+    }
     device
         .switch_storage(target)
         .await
@@ -2070,6 +2082,10 @@ async fn switch_download_storage(
         ),
     );
     Ok(())
+}
+
+fn storage_switch_needed(current: StorageIndex, target: StorageIndex) -> bool {
+    current != target
 }
 
 /// Execute Download Image page writes through RockUSB without invoking upgrade_tool.
@@ -3061,6 +3077,14 @@ mod tests {
         assert_eq!(parse_download_lba("0x00002000").unwrap(), 0x2000);
         assert_eq!(parse_download_lba("8192").unwrap(), 0x2000);
         assert!(parse_download_lba("0xnope").is_err());
+    }
+
+    #[test]
+    fn download_skips_switch_when_storage_is_already_selected() {
+        let emmc = storage_from_ui_no(2).unwrap();
+        let sd = storage_from_ui_no(3).unwrap();
+        assert!(!storage_switch_needed(emmc, emmc));
+        assert!(storage_switch_needed(sd, emmc));
     }
 
     #[test]

@@ -12,7 +12,7 @@ function deviceKeySet(list: RockusbDevice[]): Set<string> {
 
 /** Subscribe to backend USB hotplug events (no polling). */
 export function useDevicePoll(_intervalMs = 2000, appState?: AppState) {
-  const { appendLog, setDevices, selectedDeviceId, busy } = appState ?? useAppState();
+  const { appendLog, setDevices, setAdbSerial, selectedDeviceId, busy } = appState ?? useAppState();
 
   const unlisteners: Array<() => void> = [];
   let hotplugPrimed = false;
@@ -43,12 +43,26 @@ export function useDevicePoll(_intervalMs = 2000, appState?: AppState) {
     setDevices(list);
   }
 
+  async function refreshAdbDevice(rockusbDevices: RockusbDevice[]) {
+    if (rockusbDevices.length > 0) {
+      setAdbSerial(null);
+      return;
+    }
+    try {
+      const adbDevices = await toolApi.listAdbDevices();
+      setAdbSerial(adbDevices[0] ?? null);
+    } catch {
+      setAdbSerial(null);
+    }
+  }
+
   async function refreshDevices() {
     if (busy.value) return;
     try {
       const list = await toolApi.listDevices();
       // Manual / startup resync: update list without sounding
       applyDevices(list, false);
+      await refreshAdbDevice(list);
     } catch {
       // 静默：无设备或 USB 枚举失败时保持 disconnected
     }
@@ -76,6 +90,7 @@ export function useDevicePoll(_intervalMs = 2000, appState?: AppState) {
       unlisteners.push(
         await listen<RockusbDevice[]>("devices-updated", (event) => {
           applyDevices(event.payload, true);
+          void refreshAdbDevice(event.payload);
         }),
       );
     } catch (err) {

@@ -22,6 +22,7 @@ const appVersion = ref(`v${packageJson.version}`);
 const navItems = computed(() => [
   { id: "download" as const, label: t("nav.download") },
   { id: "upgrade" as const, label: t("nav.upgrade") },
+  { id: "apk-update" as const, label: t("nav.apkUpdate") },
   { id: "advanced" as const, label: t("nav.advanced") },
 ]);
 

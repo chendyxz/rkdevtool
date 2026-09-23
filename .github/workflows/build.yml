@@ -37,8 +37,8 @@ jobs:
       matrix:
         include:
           - platform: macos-latest
-            args: --target universal-apple-darwin
-            bundle: src-tauri/target/universal-apple-darwin/release/bundle/
+            args: --target aarch64-apple-darwin
+            bundle: src-tauri/target/aarch64-apple-darwin/release/bundle/
           - platform: ubuntu-22.04
             args: ""
             bundle: src-tauri/target/release/bundle/
@@ -61,7 +61,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - name: Install dependencies (Ubuntu)
         if: matrix.platform == 'ubuntu-22.04'
@@ -107,6 +107,12 @@ jobs:
             codesign --force --options runtime --timestamp --sign "$CERT_ID" "$TOOL"
             codesign --verify --verbose "$TOOL"
           fi
+          for TOOL in src-tauri/resources/firmware-tools/macos-arm64/*; do
+            codesign --force --options runtime --timestamp --sign "$CERT_ID" "$TOOL"
+            codesign --verify --verbose "$TOOL"
+          done
+          tar -czf src-tauri/resources/firmware-tools/macos-arm64.tar.gz \
+            -C src-tauri/resources/firmware-tools/macos-arm64 .
 
       - name: Install frontend dependencies
         run: npm ci

@@ -34,6 +34,7 @@ function createAppState() {
   const activePage = ref<PageId>("download");
   const deviceState = ref<DeviceState>("disconnected");
   const devices = ref<RockusbDevice[]>([]);
+  const adbSerial = ref<string | null>(null);
   const selectedDeviceId = ref<string | null>(null);
   const toolInfo = ref<ToolInfo | null>(null);
   const logs = ref<LogEntry[]>([]);
@@ -74,7 +75,7 @@ function createAppState() {
   function setDevices(list: RockusbDevice[]) {
     devices.value = list;
     if (list.length === 0) {
-      deviceState.value = "disconnected";
+      deviceState.value = adbSerial.value ? "adb" : "disconnected";
       selectedDeviceId.value = null;
       deviceSelector.value = "";
       return;
@@ -89,6 +90,13 @@ function createAppState() {
     deviceState.value = current.mode.toUpperCase().includes("LOADER") ? "loader" : "connected";
   }
 
+  function setAdbSerial(serial: string | null) {
+    adbSerial.value = serial;
+    if (devices.value.length === 0) {
+      deviceState.value = serial ? "adb" : "disconnected";
+    }
+  }
+
   function setBusy(value: boolean) {
     busy.value = value;
   }
@@ -97,6 +105,7 @@ function createAppState() {
     activePage,
     deviceState,
     devices,
+    adbSerial,
     selectedDeviceId,
     deviceSelector,
     toolInfo,
@@ -105,6 +114,7 @@ function createAppState() {
     appendLog,
     clearLogs,
     setDevices,
+    setAdbSerial,
     setBusy,
   };
 }

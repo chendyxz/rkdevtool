@@ -1,16 +1,20 @@
-pub mod firmware;
+mod adb;
+pub mod apk_update;
 mod device_ops;
 mod devices;
+pub mod firmware;
 mod state;
 mod upgrade_tool;
 
+use adb::{list_adb_devices, reboot_to_loader};
+use apk_update::update_firmware_apk;
+use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_firmware};
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
 use state::AppState;
 use upgrade_tool::{
     download_execute, get_tool_info, is_tool_busy, list_devices, partition_list, run_action,
     select_device,
 };
-use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_firmware};
 
 #[tauri::command]
 fn parse_firmware(path: String) -> Result<FirmwareInfo, String> {
@@ -52,6 +56,9 @@ pub fn run() {
             get_current_storage,
             run_action,
             is_tool_busy,
+            list_adb_devices,
+            reboot_to_loader,
+            update_firmware_apk,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

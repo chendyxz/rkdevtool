@@ -1,17 +1,21 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useAppState } from "../../composables/useAppState";
 import { useI18n } from "../../i18n";
+import { toolApi } from "../../composables/useToolCommand";
 
 const emit = defineEmits<{
   deviceChange: [locationId: string];
 }>();
 
-const { deviceState, devices, selectedDeviceId, busy } = useAppState();
+const { deviceState, devices, selectedDeviceId, adbSerial, busy, appendLog } = useAppState();
 const { t } = useI18n();
+const switching = ref(false);
 
 const statusLabel = computed(() => {
   switch (deviceState.value) {
+    case "adb":
+      return t("status.adb");
     case "connected":
       return t("status.maskrom");
     case "loader":
@@ -23,6 +27,8 @@ const statusLabel = computed(() => {
 
 const dotColor = computed(() => {
   switch (deviceState.value) {
+    case "adb":
+      return "var(--color-warning)";
     case "connected":
       return "var(--color-success)";
     case "loader":
@@ -36,6 +42,20 @@ function onSelect(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   if (value) emit("deviceChange", value);
 }
+
+async function switchToLoader() {
+  if (!adbSerial.value || switching.value) return;
+  switching.value = true;
+  appendLog(t("status.switchingToLoader"), "info");
+  try {
+    await toolApi.rebootToLoader(adbSerial.value);
+    appendLog(t("status.switchedToLoader"), "success");
+  } catch (error) {
+    appendLog(String(error), "error");
+  } finally {
+    switching.value = false;
+  }
+}
 </script>
 
 <template>
@@ -44,6 +64,14 @@ function onSelect(event: Event) {
       <span class="status-bar__dot" :style="{ background: dotColor }" />
       <span class="status-bar__text">{{ statusLabel }}</span>
       <span v-if="busy" class="status-bar__busy">{{ t("status.busy") }}</span>
+      <button
+        v-if="deviceState === 'adb'"
+        class="status-bar__switch"
+        :disabled="switching"
+        @click="switchToLoader"
+      >
+        {{ switching ? t("status.switching") : t("status.switch") }}
+      </button>
     </div>
     <select
       class="status-bar__select"
@@ -51,7 +79,9 @@ function onSelect(event: Event) {
       :disabled="devices.length === 0"
       @change="onSelect"
     >
-      <option v-if="devices.length === 0" value="">{{ t("status.noDevice") }}</option>
+      <option v-if="devices.length === 0" value="">
+        {{ adbSerial ? `ADB: ${adbSerial}` : t("status.noDevice") }}
+      </option>
       <option v-for="device in devices" :key="device.location_id" :value="device.location_id">
         {{ device.label }}
       </option>
@@ -93,6 +123,21 @@ function onSelect(event: Event) {
 .status-bar__busy {
   font-size: 12px;
   color: var(--color-primary);
+}
+
+.status-bar__switch {
+  height: 28px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--border-radius-md);
+  background: var(--color-primary);
+  color: white;
+  cursor: pointer;
+}
+
+.status-bar__switch:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .status-bar__select {

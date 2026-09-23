@@ -16,6 +16,14 @@ export function listDevices() {
   return invoke<RockusbDevice[]>("list_devices");
 }
 
+export function listAdbDevices() {
+  return invoke<string[]>("list_adb_devices");
+}
+
+export function rebootToLoader(serial: string) {
+  return invoke<void>("reboot_to_loader", { serial });
+}
+
 export function selectDevice(locationId: string | null) {
   return invoke<void>("select_device", { locationId });
 }
@@ -58,4 +66,8 @@ export function getCurrentStorage() {
 
 export function isToolBusy() {
   return invoke<boolean>("is_tool_busy");
+}
+
+export function updateFirmwareApk(firmware: string, apk: string, output: string, apkPath: string) {
+  return invoke<string>("update_firmware_apk", { firmware, apk, output, apkPath });
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref, watch } from "vue";
 import AppButton from "../ui/AppButton.vue";
 import PathField from "../ui/PathField.vue";
 import { useAppState } from "../../composables/useAppState";
@@ -34,12 +34,8 @@ const storageIndexMap: Record<string, string> = {
   PCIE: "10",
 };
 
-const forceByAddress = ref(false);
-const selectedRowId = ref(1);
-const loaderVersion = ref("");
-let nextId = 2;
-
-const rows = ref<PartitionRow[]>([
+const DOWNLOAD_CONFIG_KEY = "rkdevtool.download-config.v1";
+const defaultRows: PartitionRow[] = [
   {
     id: 1,
     enabled: true,
@@ -48,7 +44,53 @@ const rows = ref<PartitionRow[]>([
     name: "Loader",
     path: "",
   },
-]);
+];
+
+interface DownloadConfig {
+  rows: PartitionRow[];
+  forceByAddress: boolean;
+}
+
+function loadConfig(): DownloadConfig {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DOWNLOAD_CONFIG_KEY) ?? "null");
+    if (saved && Array.isArray(saved.rows)) {
+      return {
+        rows: saved.rows,
+        forceByAddress: saved.forceByAddress === true,
+      };
+    }
+  } catch {
+    // Ignore invalid or obsolete local data and restore defaults.
+  }
+  return { rows: defaultRows, forceByAddress: false };
+}
+
+const savedConfig = loadConfig();
+const forceByAddress = ref(savedConfig.forceByAddress);
+const selectedRowId = ref(1);
+const loaderVersion = ref("");
+let nextId = Math.max(0, ...savedConfig.rows.map((row) => row.id)) + 1;
+
+const rows = ref<PartitionRow[]>(savedConfig.rows);
+
+watch(
+  [rows, forceByAddress],
+  () => {
+    localStorage.setItem(
+      DOWNLOAD_CONFIG_KEY,
+      JSON.stringify({ rows: rows.value, forceByAddress: forceByAddress.value }),
+    );
+  },
+  { deep: true, flush: "sync" },
+);
+
+onMounted(() => {
+  const loader = rows.value.find(
+    (row) => row.path && row.name.toLowerCase().includes("loader"),
+  );
+  if (loader) void refreshLoaderVersion(loader.path);
+});
 
 function selectRow(id: number) {
   selectedRowId.value = id;
