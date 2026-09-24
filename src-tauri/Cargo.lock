@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "rkdevtool"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "afptool-rs",
  "futures",
