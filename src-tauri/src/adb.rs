@@ -2,38 +2,22 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::state::AppState;
 
-fn adb_path() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join("adb"))
-            .find(|path| path.is_file())
-    }) {
-        return Ok(path);
-    }
-
-    let mut candidates = vec![
-        PathBuf::from("/opt/homebrew/bin/adb"),
-        PathBuf::from("/usr/local/bin/adb"),
-    ];
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join("Library/Android/sdk/platform-tools/adb"));
-    }
-    for name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
-        if let Some(root) = std::env::var_os(name) {
-            candidates.push(PathBuf::from(root).join("platform-tools/adb"));
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "ADB not found. Install Android Platform Tools or add adb to PATH".to_string()
-        })
+fn adb_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/platform-tools/macos-arm64/adb")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| e.to_string())?
+            .join("resources/platform-tools/macos-arm64/adb")
+    };
+    path.is_file()
+        .then_some(path)
+        .ok_or_else(|| "Bundled ADB is missing from the application resources".to_string())
 }
 
 fn parse_adb_devices(output: &str) -> Vec<String> {
@@ -49,8 +33,8 @@ fn parse_adb_devices(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn adb_devices_sync() -> Result<Vec<String>, String> {
-    let output = Command::new(adb_path()?)
+fn adb_devices_sync(adb: PathBuf) -> Result<Vec<String>, String> {
+    let output = Command::new(adb)
         .arg("devices")
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;
@@ -61,8 +45,9 @@ fn adb_devices_sync() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-pub async fn list_adb_devices() -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(adb_devices_sync)
+pub async fn list_adb_devices(app: AppHandle) -> Result<Vec<String>, String> {
+    let adb = adb_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || adb_devices_sync(adb))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -73,7 +58,7 @@ pub async fn reboot_to_loader(
     state: State<'_, AppState>,
     serial: String,
 ) -> Result<(), String> {
-    let adb = adb_path()?;
+    let adb = adb_path(&app)?;
     let output = tauri::async_runtime::spawn_blocking(move || {
         Command::new(adb)
             .args(["-s", &serial, "reboot", "loader"])

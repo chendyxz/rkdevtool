@@ -56,6 +56,9 @@ jobs:
             codesign --force --sign - "$TOOL"
             codesign --verify --verbose "$TOOL"
           fi
+          TOOL="src-tauri/resources/platform-tools/macos-arm64/adb"
+          codesign --force --sign - "$TOOL"
+          codesign --verify --verbose "$TOOL"
           for TOOL in src-tauri/resources/firmware-tools/macos-arm64/*; do
             codesign --force --sign - "$TOOL"
             codesign --verify --verbose "$TOOL"
