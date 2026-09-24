@@ -4,9 +4,16 @@ import AppButton from "../ui/AppButton.vue";
 import PathField from "../ui/PathField.vue";
 import { useAppState } from "../../composables/useAppState";
 import { useToolCommand, toolApi } from "../../composables/useToolCommand";
+import {
+  cachedFirmwareInfo,
+  isMissingFileError,
+  loadFirmwareInfo,
+  shouldReportFirmwareIssue,
+} from "../../composables/useFirmwareInfo";
 import { pickFile } from "../../composables/useFilePicker";
 import { useI18n } from "../../i18n";
 import { logText } from "../../i18n/logText";
+import type { FirmwareInfo } from "../../types/tool";
 
 const { appendLog, busy, deviceState } = useAppState();
 const { run } = useToolCommand();
@@ -18,29 +25,56 @@ const firmwareVersion = ref("");
 const loaderVersion = ref("");
 const chipInfo = ref("");
 
+// 芯片信息可能来自固件解析，也可能来自设备读取；固件失效时只能清除前者。
+let chipInfoFromFirmware = false;
+
 watch(firmwarePath, (path) => {
   localStorage.setItem(UPGRADE_CONFIG_KEY, path);
+  // 清空路径后不应再保留上一份固件的信息。
+  if (!path.trim()) clearFirmwareInfo();
 }, { flush: "sync" });
+
+function applyFirmwareInfo(info: FirmwareInfo) {
+  firmwareVersion.value = info.firmware_version || "";
+  loaderVersion.value = info.loader_version || "";
+  chipInfo.value = info.chip_family || "";
+  chipInfoFromFirmware = true;
+}
+
+function clearFirmwareInfo() {
+  firmwareVersion.value = "";
+  loaderVersion.value = "";
+  if (chipInfoFromFirmware) {
+    chipInfo.value = "";
+    chipInfoFromFirmware = false;
+  }
+}
 
 async function refreshFirmwareInfo() {
   const path = firmwarePath.value.trim();
   if (!path) {
-    firmwareVersion.value = "";
-    loaderVersion.value = "";
-    chipInfo.value = "";
+    clearFirmwareInfo();
     return;
   }
 
   try {
-    const info = await toolApi.parseFirmware(path);
-    firmwareVersion.value = info.firmware_version || "";
-    loaderVersion.value = info.loader_version || "";
-    chipInfo.value = info.chip_family || "";
+    applyFirmwareInfo(await loadFirmwareInfo(path));
   } catch (err) {
-    firmwareVersion.value = "";
-    loaderVersion.value = "";
-    chipInfo.value = "";
-    appendLog(String(err), "error");
+    // 固件被删除或移动后解析必然失败：清掉信息，同一路径只提示一次。
+    clearFirmwareInfo();
+    // 确认文件不存在才连路径一起清空（watch 会同步落盘 localStorage）；
+    // 格式不支持、权限不足等错误保留路径，便于用户排查。
+    const missing = isMissingFileError(err);
+    if (missing) firmwarePath.value = "";
+
+    if (!shouldReportFirmwareIssue(path)) return;
+
+    appendLog(
+      missing
+        ? logText("upgrade.firmwareMissing", { path })
+        : String(err),
+      "error",
+    );
   }
 }
 
@@ -53,6 +87,8 @@ async function browseFirmware() {
 }
 
 async function refreshChipInfo() {
+  chipInfoFromFirmware = false;
+
   if (deviceState.value !== "loader") {
     chipInfo.value = t("upgrade.maskromChipHint");
     return;
@@ -78,16 +114,25 @@ async function upgrade() {
     appendLog(logText("upgrade.upgradeSuccess"), "success");
   } catch (err) {
     appendLog(String(err), "error");
+    // 升级时才发觉文件已被删除：同样清掉路径，避免下次再试还是同一个错。
+    if (isMissingFileError(err)) {
+      firmwarePath.value = "";
+    }
   }
 }
 
 onMounted(() => {
-  if (firmwarePath.value) void refreshFirmwareInfo();
   if (deviceState.value === "loader") {
     refreshChipInfo();
   } else {
     chipInfo.value = "";
+    chipInfoFromFirmware = false;
   }
+
+  // 命中缓存先同步回显，避免切回页面时信息闪空；后台仍会重新校验。
+  const cached = cachedFirmwareInfo(firmwarePath.value);
+  if (cached) applyFirmwareInfo(cached);
+  if (firmwarePath.value) void refreshFirmwareInfo();
 });
 </script>
 

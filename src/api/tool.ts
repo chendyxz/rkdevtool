@@ -108,3 +108,15 @@ export function isToolBusy() {
 export function updateFirmwareApk(firmware: string, apk: string, output: string, apkPath: string) {
   return invoke<string>("update_firmware_apk", { firmware, apk, output, apkPath });
 }
+
+export interface OtaZipRequest {
+  kind: "apk" | "rom";
+  version: string;
+  pk: string;
+  source: string;
+  output: string;
+}
+
+export function buildOtaZip(request: OtaZipRequest) {
+  return invoke<string>("build_ota_zip", { request });
+}

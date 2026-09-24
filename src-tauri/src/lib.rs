@@ -4,6 +4,7 @@ mod device_ops;
 mod devices;
 pub mod firmware;
 mod logcat;
+pub mod ota;
 mod state;
 mod upgrade_tool;
 
@@ -15,6 +16,7 @@ use apk_update::update_firmware_apk;
 use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_firmware};
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
 use logcat::{clear_logcat, export_logcat, start_logcat, stop_logcat};
+use ota::build_ota_zip;
 use state::AppState;
 use upgrade_tool::{
     download_execute, get_tool_info, is_tool_busy, list_devices, partition_list, run_action,
@@ -22,8 +24,11 @@ use upgrade_tool::{
 };
 
 #[tauri::command]
-fn parse_firmware(path: String) -> Result<FirmwareInfo, String> {
-    parse_firmware_info(&path)
+async fn parse_firmware(path: String) -> Result<FirmwareInfo, String> {
+    // 固件包可达 GB 级，解析必须离开主线程，否则切换页面时会冻结窗口。
+    tauri::async_runtime::spawn_blocking(move || parse_firmware_info(&path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -72,7 +77,14 @@ pub fn run() {
             clear_logcat,
             export_logcat,
             update_firmware_apk,
+            build_ota_zip,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // 退出前回收常驻子进程，否则 adb logcat 会成为孤儿进程继续占用设备
+            if matches!(event, tauri::RunEvent::Exit) {
+                logcat::shutdown(app_handle);
+            }
+        });
 }

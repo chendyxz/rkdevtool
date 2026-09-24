@@ -1,9 +1,12 @@
 use afptool_rs::{UpdateHeader, RKAF_SIGNATURE, RKFW_SIGNATURE};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::mem;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FirmwareInfo {
@@ -13,12 +16,67 @@ pub struct FirmwareInfo {
     pub chip_family: String,
 }
 
+/// 解析需要把整个固件读入内存（GB 级），切页面等重复调用必须命中缓存。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct InfoCacheKey {
+    path: PathBuf,
+    modified_ms: u64,
+    size: u64,
+}
+
+const INFO_CACHE_CAPACITY: usize = 16;
+
+static INFO_CACHE: LazyLock<Mutex<HashMap<InfoCacheKey, FirmwareInfo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn info_cache() -> MutexGuard<'static, HashMap<InfoCacheKey, FirmwareInfo>> {
+    INFO_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 文件指纹：修改时间 + 大小。两者任一变化都会让缓存失效。
+fn file_stamp(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((modified_ms, metadata.len()))
+}
+
 pub fn parse_firmware_info(path: &str) -> Result<FirmwareInfo, String> {
     let path = Path::new(path);
     if !path.exists() {
         return Err(format!("File not found: {}", path.display()));
     }
 
+    let cache_key = file_stamp(path).map(|(modified_ms, size)| InfoCacheKey {
+        path: path.to_path_buf(),
+        modified_ms,
+        size,
+    });
+
+    if let Some(key) = cache_key.as_ref() {
+        if let Some(info) = info_cache().get(key) {
+            return Ok(info.clone());
+        }
+    }
+
+    let info = parse_firmware_info_uncached(path)?;
+
+    if let Some(key) = cache_key {
+        let mut cache = info_cache();
+        if cache.len() >= INFO_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, info.clone());
+    }
+
+    Ok(info)
+}
+
+fn parse_firmware_info_uncached(path: &Path) -> Result<FirmwareInfo, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
@@ -357,5 +415,41 @@ mod tests {
         sample[8] = 0;
         sample[9] = 1;
         assert_eq!(format_rkfw_version(&sample), "1.0.256");
+    }
+
+    fn write_min_rkfw(path: &Path, minor: u8, len: usize) {
+        let mut buf = vec![0u8; len];
+        buf[0..4].copy_from_slice(RKFW_SIGNATURE);
+        buf[6] = 0;
+        buf[7] = 0;
+        buf[8] = minor;
+        buf[9] = 1;
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    #[test]
+    fn firmware_info_cache_hits_and_invalidates() {
+        let dir = std::env::temp_dir().join(format!("rkdevtool-info-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("update.img");
+
+        write_min_rkfw(&path, 0, 0x40);
+        let first = parse_firmware_info(path.to_str().unwrap()).unwrap();
+        assert_eq!(first.firmware_version, "1.0.0");
+
+        let (modified_ms, size) = file_stamp(&path).unwrap();
+        let key = InfoCacheKey {
+            path: path.clone(),
+            modified_ms,
+            size,
+        };
+        assert!(info_cache().contains_key(&key));
+
+        // 文件变化（大小/内容）后指纹失效，必须重新解析
+        write_min_rkfw(&path, 7, 0x48);
+        let second = parse_firmware_info(path.to_str().unwrap()).unwrap();
+        assert_eq!(second.firmware_version, "1.7.0");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

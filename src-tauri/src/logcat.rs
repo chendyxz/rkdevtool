@@ -133,6 +133,19 @@ pub fn stop_logcat(state: State<'_, AppState>) -> Result<(), String> {
     stop_child(state.inner())
 }
 
+/// 应用退出前回收常驻的 logcat 子进程。
+///
+/// 不清理的话 adb 会变成孤儿进程继续向设备拉流，反复重启应用后
+/// 系统里会累积一串 `adb logcat`，设备端也白白多跑几路日志。
+pub fn shutdown(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(mut generation) = state.logcat_generation.lock() {
+        // 递增代号，让输出线程知道这是主动关闭，不再补发 logcat-stopped
+        *generation = generation.wrapping_add(1);
+    }
+    let _ = stop_child(state.inner());
+}
+
 #[tauri::command]
 pub fn clear_logcat(state: State<'_, AppState>) -> Result<(), String> {
     state

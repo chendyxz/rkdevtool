@@ -24,6 +24,8 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 md5 = "0.7"
+# OTA 打包需要存储模式（不压缩）写入 zip，与 `zip -0` 生成的包保持一致
+zip = "4"
 afptool-rs = { git = "https://github.com/suyulin/afptool-rs", tag = "v1.2.3" }
 rockusb = { path = "vendor/rockchiprs/rockusb", features = ["nusb", "windows-driver"] }
 rockfile = { path = "vendor/rockchiprs/rockfile" }

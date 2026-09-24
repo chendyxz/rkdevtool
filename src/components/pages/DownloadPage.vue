@@ -4,6 +4,7 @@ import AppButton from "../ui/AppButton.vue";
 import PathField from "../ui/PathField.vue";
 import { useAppState } from "../../composables/useAppState";
 import { useToolCommand, toolApi } from "../../composables/useToolCommand";
+import { cachedFirmwareInfo, loadFirmwareInfo } from "../../composables/useFirmwareInfo";
 import { pickFile } from "../../composables/useFilePicker";
 import { useI18n } from "../../i18n";
 import { logText } from "../../i18n/logText";
@@ -89,7 +90,12 @@ onMounted(() => {
   const loader = rows.value.find(
     (row) => row.path && row.name.toLowerCase().includes("loader"),
   );
-  if (loader) void refreshLoaderVersion(loader.path);
+  if (!loader) return;
+
+  // 命中缓存先同步回显，避免切回页面时版本号闪空；后台仍会重新校验。
+  const cached = cachedFirmwareInfo(loader.path);
+  if (cached) loaderVersion.value = cached.loader_version || "";
+  void refreshLoaderVersion(loader.path);
 });
 
 function selectRow(id: number) {
@@ -118,7 +124,7 @@ async function browsePath(row: PartitionRow) {
 
 async function refreshLoaderVersion(path: string) {
   try {
-    const info = await toolApi.parseFirmware(path);
+    const info = await loadFirmwareInfo(path);
     loaderVersion.value = info.loader_version || "";
   } catch {
     loaderVersion.value = "";

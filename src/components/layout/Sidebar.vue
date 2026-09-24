@@ -26,6 +26,7 @@ const navItems = computed(() => [
   { id: "burn-parameters" as const, label: t("nav.burnParameters") },
   { id: "download" as const, label: t("nav.download") },
   { id: "apk-update" as const, label: t("nav.apkUpdate") },
+  { id: "ota-package" as const, label: t("nav.otaPackage") },
   { id: "advanced" as const, label: t("nav.advanced") },
 ]);
 

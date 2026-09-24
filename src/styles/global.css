@@ -1,5 +1,14 @@
 @import "../../design/tokens/variables.css";
 
+/*
+ * 必须声明支持的主题，原生滚动条与表单控件才会跟随系统主题绘制。
+ * 不声明时 WebKit 一律按浅色主题画滚动条（深色滑块），
+ * 落在深色日志底上几乎看不见。
+ */
+:root {
+  color-scheme: light dark;
+}
+
 *,
 *::before,
 *::after {

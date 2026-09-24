@@ -19,8 +19,15 @@ function pickFileViaInput(): Promise<string | null> {
   });
 }
 
-export async function pickSavePath(title?: string, defaultPath?: string): Promise<string | null> {
-  const selected = await save({ title, defaultPath, filters: [{ name: "Rockchip firmware", extensions: ["img"] }] });
+export async function pickSavePath(
+  title?: string,
+  defaultPath?: string,
+  filter: { name: string; extensions: string[] } = {
+    name: "Rockchip firmware",
+    extensions: ["img"],
+  },
+): Promise<string | null> {
+  const selected = await save({ title, defaultPath, filters: [filter] });
   return typeof selected === "string" ? selected : null;
 }
 

@@ -79,7 +79,7 @@ struct LbaWriteChunk {
     transfer_len: usize,
 }
 
-fn format_byte_count(bytes: u64) -> String {
+pub(crate) fn format_byte_count(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
 
     let mut value = bytes as f64;

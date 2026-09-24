@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import ScrollBar from "../ui/ScrollBar.vue";
 import { useAppState } from "../../composables/useAppState";
 import { useI18n } from "../../i18n";
 
@@ -32,7 +33,7 @@ async function scrollToBottom() {
 }
 
 watch(
-  () => logs.value.map((entry) => `${entry.id}:${entry.text}`).join("\n"),
+  () => `${logs.value.length}:${logs.value[logs.value.length - 1]?.text ?? ""}`,
   () => {
     scrollToBottom();
   },
@@ -89,15 +90,18 @@ onUnmounted(stopResize);
         <button type="button" class="log-panel__clear" @click="handleClear">{{ t("log.clear") }}</button>
       </div>
     </header>
-    <div ref="contentRef" class="log-panel__content" :class="{ 'log-panel__content--wrap': wrapLines }" @scroll="onScroll">
-      <p
-        v-for="entry in logs"
-        :key="entry.id"
-        class="log-line"
-        :class="[levelClass(entry.level), entry.kind === 'progress' && 'log-line--progress']"
-      >
-        {{ entry.text }}
-      </p>
+    <div class="log-panel__viewport">
+      <div ref="contentRef" class="log-panel__content" :class="{ 'log-panel__content--wrap': wrapLines }" @scroll="onScroll">
+        <p
+          v-for="entry in logs"
+          :key="entry.id"
+          class="log-line"
+          :class="[levelClass(entry.level), entry.kind === 'progress' && 'log-line--progress']"
+        >
+          {{ entry.text }}
+        </p>
+      </div>
+      <ScrollBar :target="contentRef" />
     </div>
   </aside>
 </template>
@@ -112,6 +116,8 @@ onUnmounted(stopResize);
   background: var(--color-log-bg);
   display: flex;
   flex-direction: column;
+  /* 面板底始终是深色，声明 dark 才能得到浅色的系统滚动条 */
+  color-scheme: dark;
 }
 
 .log-panel__resize {
@@ -165,34 +171,29 @@ onUnmounted(stopResize);
   color: #60a5fa;
 }
 
+.log-panel__viewport {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
 .log-panel__content {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: scroll;
+  overflow: auto;
   padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  scrollbar-gutter: stable;
+  /* 原生滚动条交给 ScrollBar 自绘 */
+  scrollbar-width: none;
 }
 
 .log-panel__content::-webkit-scrollbar {
-  width: 8px;
-}
-
-.log-panel__content::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.log-panel__content::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.35);
-  border-radius: 4px;
-}
-
-.log-panel__content::-webkit-scrollbar-thumb:hover {
-  background: rgba(148, 163, 184, 0.55);
+  display: none;
 }
 
 .log-line {

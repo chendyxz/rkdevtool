@@ -12,6 +12,7 @@ import ApkInstallPage from "../pages/ApkInstallPage.vue";
 import LogcatPage from "../pages/LogcatPage.vue";
 import ApkUpdatePage from "../pages/ApkUpdatePage.vue";
 import BurnParametersPage from "../pages/BurnParametersPage.vue";
+import OtaPackagePage from "../pages/OtaPackagePage.vue";
 import AdvancedPage from "../pages/AdvancedPage.vue";
 import { useI18n } from "../../i18n";
 
@@ -37,6 +38,8 @@ const pageTitle = computed(() => {
       return t("page.apkUpdate");
     case "burn-parameters":
       return t("page.burnParameters");
+    case "ota-package":
+      return t("page.otaPackage");
   }
 });
 </script>
@@ -55,6 +58,7 @@ const pageTitle = computed(() => {
           <LogcatPage v-else-if="activePage === 'logcat'" />
           <ApkUpdatePage v-else-if="activePage === 'apk-update'" />
           <BurnParametersPage v-else-if="activePage === 'burn-parameters'" />
+          <OtaPackagePage v-else-if="activePage === 'ota-package'" />
           <AdvancedPage v-else />
         </div>
       </div>
