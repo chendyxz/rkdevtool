@@ -8,6 +8,8 @@ import StatusBar from "./StatusBar.vue";
 import PageHeader from "./PageHeader.vue";
 import DownloadPage from "../pages/DownloadPage.vue";
 import UpgradePage from "../pages/UpgradePage.vue";
+import ApkInstallPage from "../pages/ApkInstallPage.vue";
+import LogcatPage from "../pages/LogcatPage.vue";
 import ApkUpdatePage from "../pages/ApkUpdatePage.vue";
 import BurnParametersPage from "../pages/BurnParametersPage.vue";
 import AdvancedPage from "../pages/AdvancedPage.vue";
@@ -25,6 +27,10 @@ const pageTitle = computed(() => {
       return t("page.download");
     case "upgrade":
       return t("page.upgrade");
+    case "apk-install":
+      return t("page.apkInstall");
+    case "logcat":
+      return t("page.logcat");
     case "advanced":
       return t("page.advanced");
     case "apk-update":
@@ -45,6 +51,8 @@ const pageTitle = computed(() => {
         <div class="left-panel">
           <DownloadPage v-if="activePage === 'download'" />
           <UpgradePage v-else-if="activePage === 'upgrade'" />
+          <ApkInstallPage v-else-if="activePage === 'apk-install'" />
+          <LogcatPage v-else-if="activePage === 'logcat'" />
           <ApkUpdatePage v-else-if="activePage === 'apk-update'" />
           <BurnParametersPage v-else-if="activePage === 'burn-parameters'" />
           <AdvancedPage v-else />

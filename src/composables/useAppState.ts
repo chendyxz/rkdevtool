@@ -31,7 +31,7 @@ function shouldUpdateLastLine(last: LogEntry, next: string, update: boolean): bo
 let logId = 0;
 
 function createAppState() {
-  const activePage = ref<PageId>("download");
+  const activePage = ref<PageId>("apk-install");
   const deviceState = ref<DeviceState>("disconnected");
   const devices = ref<RockusbDevice[]>([]);
   const adbSerial = ref<string | null>(null);

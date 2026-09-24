@@ -20,8 +20,36 @@ export function listAdbDevices() {
   return invoke<string[]>("list_adb_devices");
 }
 
+export function connectAdbDevice(address: string) {
+  return invoke<string>("connect_adb_device", { address });
+}
+
 export function rebootToLoader(serial: string) {
   return invoke<void>("reboot_to_loader", { serial });
+}
+
+export function installApk(serial: string, path: string) {
+  return invoke<string>("install_apk", { serial, path });
+}
+
+export function runAdbControl(serial: string, action: string) {
+  return invoke<string>("run_adb_control", { serial, action });
+}
+
+export function startLogcat(serial: string) {
+  return invoke<void>("start_logcat", { serial });
+}
+
+export function stopLogcat() {
+  return invoke<void>("stop_logcat");
+}
+
+export function clearLogcat() {
+  return invoke<void>("clear_logcat");
+}
+
+export function exportLogcat(path: string) {
+  return invoke<number>("export_logcat", { path });
 }
 
 export interface BurnParameter {

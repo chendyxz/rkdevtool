@@ -20,10 +20,12 @@ const { checking, updating, progressText, checkForUpdates } = useAppUpdater();
 const appVersion = ref(`v${packageJson.version}`);
 
 const navItems = computed(() => [
-  { id: "download" as const, label: t("nav.download") },
+  { id: "apk-install" as const, label: t("nav.apkInstall") },
+  { id: "logcat" as const, label: t("nav.logcat") },
   { id: "upgrade" as const, label: t("nav.upgrade") },
-  { id: "apk-update" as const, label: t("nav.apkUpdate") },
   { id: "burn-parameters" as const, label: t("nav.burnParameters") },
+  { id: "download" as const, label: t("nav.download") },
+  { id: "apk-update" as const, label: t("nav.apkUpdate") },
   { id: "advanced" as const, label: t("nav.advanced") },
 ]);
 

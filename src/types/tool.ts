@@ -49,3 +49,7 @@ export interface ToolLogEvent {
   level: LogLevel;
   update?: boolean;
 }
+
+export interface LogcatLinesEvent {
+  lines: string[];
+}

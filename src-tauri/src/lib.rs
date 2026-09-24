@@ -3,13 +3,18 @@ pub mod apk_update;
 mod device_ops;
 mod devices;
 pub mod firmware;
+mod logcat;
 mod state;
 mod upgrade_tool;
 
-use adb::{burn_parameters, list_adb_devices, reboot_to_loader};
+use adb::{
+    burn_parameters, connect_adb_device, install_apk, list_adb_devices, reboot_to_loader,
+    run_adb_control,
+};
 use apk_update::update_firmware_apk;
 use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_firmware};
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
+use logcat::{clear_logcat, export_logcat, start_logcat, stop_logcat};
 use state::AppState;
 use upgrade_tool::{
     download_execute, get_tool_info, is_tool_busy, list_devices, partition_list, run_action,
@@ -57,8 +62,15 @@ pub fn run() {
             run_action,
             is_tool_busy,
             list_adb_devices,
+            connect_adb_device,
             reboot_to_loader,
+            install_apk,
+            run_adb_control,
             burn_parameters,
+            start_logcat,
+            stop_logcat,
+            clear_logcat,
+            export_logcat,
             update_firmware_apk,
         ])
         .run(tauri::generate_context!())

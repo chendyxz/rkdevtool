@@ -17,13 +17,16 @@ function loadConfig() {
         firmware: typeof saved.firmware === "string" ? saved.firmware : "",
         apk: typeof saved.apk === "string" ? saved.apk : "",
         output: typeof saved.output === "string" ? saved.output : "",
-        target: typeof saved.target === "string" ? saved.target : "/system/app/lxzk/lxzk.apk",
+        target:
+          typeof saved.target === "string" && saved.target !== "/system/app/lxzk/lxzk.apk"
+            ? saved.target
+            : "",
       };
     }
   } catch {
     // Ignore invalid or obsolete local data.
   }
-  return { firmware: "", apk: "", output: "", target: "/system/app/lxzk/lxzk.apk" };
+  return { firmware: "", apk: "", output: "", target: "" };
 }
 
 const savedConfig = loadConfig();
