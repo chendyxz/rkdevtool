@@ -5,6 +5,7 @@ mod devices;
 pub mod firmware;
 mod logcat;
 pub mod ota;
+mod platform;
 mod state;
 mod upgrade_tool;
 
@@ -17,6 +18,7 @@ use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_fir
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
 use logcat::{clear_logcat, export_logcat, start_logcat, stop_logcat};
 use ota::build_ota_zip;
+use platform::get_platform;
 use state::AppState;
 use upgrade_tool::{
     download_execute, get_tool_info, is_tool_busy, list_devices, partition_list, run_action,
@@ -53,6 +55,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_platform,
             get_tool_info,
             list_devices,
             select_device,

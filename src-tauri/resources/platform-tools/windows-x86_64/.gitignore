@@ -1,0 +1,7 @@
+# Fetched by packaging/windows/fetch-platform-tools.sh from Google's official
+# platform-tools-latest-windows.zip. Not committed, CI downloads them per build.
+adb.exe
+AdbWinApi.dll
+AdbWinUsbApi.dll
+NOTICE.txt
+source.properties

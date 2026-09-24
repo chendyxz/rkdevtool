@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(target_os = "macos")]
+use tauri::Manager;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::devices;
 use crate::state::AppState;
@@ -13,6 +15,10 @@ use crate::upgrade_tool::LogPayload;
 const DEFAULT_APK_PATH: &str = "/system/app/lxzk/lxzk.apk";
 const COPY_BUFFER: usize = 16 * 1024 * 1024;
 const EVENT_TOOL_LOG: &str = "tool-log";
+
+/// 固件 APK 替换依赖 e2fsprogs（debugfs / e2fsck）与 libsparse 工具，
+/// 这些二进制只随 macOS 构建打包，其余平台在调用时就地报错。
+pub const APK_UPDATE_UNSUPPORTED: &str = "Firmware APK replacement is not available in this build: the bundled e2fsprogs tools are only shipped for macOS";
 
 fn emit_log(app: &AppHandle, text: &str, level: &str) {
     let _ = app.emit(
@@ -92,6 +98,7 @@ fn copy_range(source: &Path, offset: u64, size: u64, output: &Path) -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn tool_dir(app: &AppHandle) -> Result<PathBuf, String> {
     if cfg!(debug_assertions) {
         return Ok(
@@ -123,6 +130,11 @@ fn tool_dir(app: &AppHandle) -> Result<PathBuf, String> {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(tools)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tool_dir(_app: &AppHandle) -> Result<PathBuf, String> {
+    Err(APK_UPDATE_UNSUPPORTED.to_string())
 }
 
 fn run_tool(path: &Path, args: &[&str]) -> Result<(), String> {

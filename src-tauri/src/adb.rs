@@ -1,31 +1,18 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
+use crate::platform::{adb_command, adb_path};
 use crate::state::AppState;
 use crate::upgrade_tool::LogPayload;
 
 const EVENT_TOOL_LOG: &str = "tool-log";
 const REMOTE_APK_PATH: &str = "/data/local/tmp/rkdevtool-install.apk";
-
-fn adb_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = if cfg!(debug_assertions) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/platform-tools/macos-arm64/adb")
-    } else {
-        app.path()
-            .resource_dir()
-            .map_err(|e| e.to_string())?
-            .join("resources/platform-tools/macos-arm64/adb")
-    };
-    path.is_file()
-        .then_some(path)
-        .ok_or_else(|| "Bundled ADB is missing from the application resources".to_string())
-}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +75,7 @@ fn foreground_package(output: &str) -> Option<String> {
 }
 
 fn run_adb(adb: &PathBuf, serial: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(adb)
+    let output = adb_command(adb)
         .args(["-s", serial])
         .args(args)
         .output()
@@ -134,7 +121,7 @@ fn upload_apk(app: &AppHandle, adb: &PathBuf, serial: &str, apk_path: &Path) -> 
         return Err("APK file is empty".to_string());
     }
 
-    let mut child = Command::new(adb)
+    let mut child = adb_command(adb)
         .args(["-s", serial, "shell", &format!("cat > {REMOTE_APK_PATH}")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -345,7 +332,7 @@ fn normalize_adb_address(address: &str) -> Result<String, String> {
 }
 
 fn adb_devices_sync(adb: PathBuf) -> Result<Vec<String>, String> {
-    let output = Command::new(adb)
+    let output = adb_command(&adb)
         .arg("devices")
         .output()
         .map_err(|e| format!("Failed to run adb: {e}"))?;
@@ -369,7 +356,7 @@ pub async fn connect_adb_device(app: AppHandle, address: String) -> Result<Strin
     let adb = adb_path(&app)?;
     let target = address.clone();
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(adb)
+        adb_command(&adb)
             .args(["connect", &target])
             .output()
             .map_err(|e| format!("Failed to run adb: {e}"))
@@ -404,7 +391,7 @@ pub async fn reboot_to_loader(
 ) -> Result<(), String> {
     let adb = adb_path(&app)?;
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(adb)
+        adb_command(&adb)
             .args(["-s", &serial, "reboot", "loader"])
             .output()
     })

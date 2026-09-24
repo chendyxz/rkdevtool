@@ -6,6 +6,7 @@ import type { PageId } from "../../types/app";
 import type { Locale } from "../../types/locale";
 import { GITHUB_REPO_URL } from "../../constants/app";
 import { useAppUpdater } from "../../composables/useAppUpdater";
+import { usePlatform } from "../../composables/usePlatform";
 import { useI18n } from "../../i18n";
 import packageJson from "../../../package.json";
 
@@ -17,18 +18,22 @@ const emit = defineEmits<{ navigate: [page: PageId] }>();
 
 const { locale, setLocale, t } = useI18n();
 const { checking, updating, progressText, checkForUpdates } = useAppUpdater();
+const { supportsFirmwareApkUpdate } = usePlatform();
 const appVersion = ref(`v${packageJson.version}`);
 
-const navItems = computed(() => [
-  { id: "apk-install" as const, label: t("nav.apkInstall") },
-  { id: "logcat" as const, label: t("nav.logcat") },
-  { id: "upgrade" as const, label: t("nav.upgrade") },
-  { id: "burn-parameters" as const, label: t("nav.burnParameters") },
-  { id: "download" as const, label: t("nav.download") },
-  { id: "apk-update" as const, label: t("nav.apkUpdate") },
-  { id: "ota-package" as const, label: t("nav.otaPackage") },
-  { id: "advanced" as const, label: t("nav.advanced") },
-]);
+const navItems = computed(() =>
+  [
+    { id: "apk-install" as const, label: t("nav.apkInstall") },
+    { id: "logcat" as const, label: t("nav.logcat") },
+    { id: "upgrade" as const, label: t("nav.upgrade") },
+    { id: "burn-parameters" as const, label: t("nav.burnParameters") },
+    { id: "download" as const, label: t("nav.download") },
+    { id: "apk-update" as const, label: t("nav.apkUpdate") },
+    { id: "ota-package" as const, label: t("nav.otaPackage") },
+    { id: "advanced" as const, label: t("nav.advanced") },
+    // 替换固件 APK 依赖 e2fsprogs 工具链，只有 macOS 构建打包了它
+  ].filter((item) => item.id !== "apk-update" || supportsFirmwareApkUpdate.value),
+);
 
 const updateButtonLabel = computed(() => {
   if (updating.value && progressText.value) return progressText.value;

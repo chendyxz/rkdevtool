@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::platform::hide_console;
 use crate::state::AppState;
 
 const EVENT_TOOL_LOG: &str = "tool-log";
@@ -642,13 +643,6 @@ fn pick_device_arg(device_count: usize, selected: Option<String>) -> Option<Stri
     }
 }
 
-#[cfg(windows)]
-fn apply_windows_hidden(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-
 enum SpawnedTool {
     Pipe {
         child: Child,
@@ -722,8 +716,7 @@ fn spawn_tool_pipe(
         .stderr(Stdio::piped())
         .args(tool_args);
 
-    #[cfg(windows)]
-    apply_windows_hidden(&mut cmd);
+    hide_console(&mut cmd);
 
     let mut child = cmd
         .spawn()

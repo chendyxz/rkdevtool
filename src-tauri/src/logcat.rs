@@ -1,6 +1,5 @@
 use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -8,6 +7,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::platform::{adb_command, adb_path};
 use crate::state::AppState;
 
 const EVENT_LOGCAT_LINES: &str = "logcat-lines";
@@ -18,20 +18,6 @@ const MAX_STORED_LINES: usize = 200_000;
 #[derive(Clone, Serialize)]
 struct LogcatLinesPayload {
     lines: Vec<String>,
-}
-
-fn adb_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = if cfg!(debug_assertions) {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/platform-tools/macos-arm64/adb")
-    } else {
-        app.path()
-            .resource_dir()
-            .map_err(|e| e.to_string())?
-            .join("resources/platform-tools/macos-arm64/adb")
-    };
-    path.is_file()
-        .then_some(path)
-        .ok_or_else(|| "Bundled ADB is missing from the application resources".to_string())
 }
 
 fn stop_child(state: &AppState) -> Result<(), String> {
@@ -61,7 +47,7 @@ pub fn start_logcat(
         .map_err(|e| e.to_string())?
         .clear();
 
-    let mut child = Command::new(adb_path(&app)?)
+    let mut child = adb_command(&adb_path(&app)?)
         .args(["-s", &serial, "logcat", "-v", "threadtime"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

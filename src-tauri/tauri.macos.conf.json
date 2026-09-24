@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "resources": [
+      "bin/mac/*",
+      "resources/platform-tools/macos-arm64/*",
+      "resources/firmware-tools/macos-arm64.tar.gz"
+    ],
+    "macOS": {
+      "entitlements": "entitlements.plist"
+    }
+  }
+}

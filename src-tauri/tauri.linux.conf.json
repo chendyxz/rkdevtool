@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["appimage", "deb"],
+    "resources": [
+      "bin/linux_x86-64/*",
+      "resources/platform-tools/linux-x86_64/*"
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/lib/udev/rules.d/99-rkdevtool-rockchip.rules": "../packaging/linux/99-rkdevtool-rockchip.rules"
+        },
+        "postInstallScript": "../packaging/linux/deb-postinstall.sh",
+        "postRemoveScript": "../packaging/linux/deb-postremove.sh"
+      }
+    }
+  }
+}

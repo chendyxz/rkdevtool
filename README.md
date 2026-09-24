@@ -54,15 +54,27 @@ The bundled binary is still checked at startup and remains required for these co
 
 ### Download
 
-Get installers from [Releases](https://github.com/hiifong/rkdevtool/releases):
+Get installers from [Releases](https://github.com/chendyxz/rkdevtool/releases):
 
 | Platform | Format |
 |----------|--------|
-| macOS | `.dmg` (Universal, signed + notarized) |
-| Windows | `.exe` (NSIS installer) |
+| macOS | `.dmg` (Apple Silicon / `aarch64`) |
+| Windows | `.exe` (NSIS installer, `x86_64`, unsigned) |
 | Linux | `.AppImage` / `.deb` |
 
-> CI Artifacts from `main` branch pushes are for development only. **macOS artifacts are not notarized** and cannot be opened by double-click. Use Release builds for distribution.
+> CI Artifacts from `main` branch pushes are for development only. **macOS artifacts are not notarized and Windows installers are unsigned**, so the OS warns on first launch. Use Release builds for distribution.
+
+### Platform support
+
+| Feature | macOS | Windows | Linux |
+|---------|-------|---------|-------|
+| RockUSB flashing, firmware upgrade, Download Image, Advanced | ✅ | ✅ | ✅ |
+| APK install, device log (bundled ADB) | ✅ | ✅ | — |
+| Replace firmware APK | ✅ | ❌ | ❌ |
+
+Replacing an APK inside a firmware package needs the e2fsprogs toolchain (`debugfs`, `e2fsck`) plus the libsparse tools. Those binaries only ship with the macOS build, so the page is hidden on Windows.
+
+Windows has its own prerequisites: the official Rockchip `Rockusb` driver (see below) and the fetched ADB platform-tools.
 
 ### Development
 
@@ -120,6 +132,22 @@ src-tauri/bin/
 
 Use **v2.44+** when possible. The bundled Mac tool (v2.13) has incomplete support for newer chips (e.g. RK3576); use a newer SDK binary when the remaining compatibility commands require it.
 
+**Bundled ADB**
+
+The APK install and device log pages run a bundled ADB instead of a system install:
+
+| Platform | Location | Source |
+|----------|----------|--------|
+| macOS | `src-tauri/resources/platform-tools/macos-arm64/adb` | committed |
+| Windows | `src-tauri/resources/platform-tools/windows-x86_64/` (`adb.exe` + `AdbWinApi.dll`, `AdbWinUsbApi.dll`) | downloaded, not committed |
+| Linux | not bundled yet | — |
+
+On Windows run the fetch script once before building (CI runs it automatically). It pulls Google's official `platform-tools-latest-windows.zip`:
+
+```bash
+packaging/windows/fetch-platform-tools.sh
+```
+
 **Run locally**
 
 ```bash
@@ -137,12 +165,21 @@ Output: `src-tauri/target/release/bundle/`
 
 ### Release (maintainers)
 
-Pushing a `v*` tag triggers GitHub Actions to build all platforms and publish a Release:
+Pushing a `v*` tag triggers GitHub Actions to build the macOS and Windows packages and publish them to the same Release (`windows-latest` produces an unsigned NSIS installer, `macos-latest` an Apple Silicon `.dmg`):
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+Windows needs no extra secret beyond the updater signing key:
+
+| Secret | Used by | Description |
+|--------|---------|-------------|
+| `TAURI_SIGNING_PRIVATE_KEY` | both | `tauri signer` private key content (never commit it) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | both | Key password, may be empty |
+
+Both jobs merge their platform entry into the Release `latest.json`, and use the same `concurrency` group so the merges cannot overwrite each other. Windows auto-update uses NSIS with the `passive` install mode configured in `tauri.conf.json`.
 
 macOS signing & notarization secrets:
 
@@ -195,15 +232,27 @@ macOS signing & notarization secrets:
 
 ### 下载
 
-在 [Releases](https://github.com/hiifong/rkdevtool/releases) 获取安装包：
+在 [Releases](https://github.com/chendyxz/rkdevtool/releases) 获取安装包：
 
 | 平台 | 格式 |
 |------|------|
-| macOS | `.dmg`（Universal，已签名 + 公证） |
-| Windows | `.exe`（NSIS 安装包） |
+| macOS | `.dmg`（Apple Silicon / `aarch64`） |
+| Windows | `.exe`（NSIS 安装包，`x86_64`，未签名） |
 | Linux | `.AppImage` / `.deb` |
 
-> push `main` 分支的 CI Artifacts 仅供开发测试，**macOS 未公证，无法直接双击打开**。请从 Release 下载正式版。
+> push `main` 分支的 CI Artifacts 仅供开发测试，**macOS 未公证、Windows 未签名**，首次打开时系统会给出风险提示。请从 Release 下载正式版。
+
+### 平台支持
+
+| 功能 | macOS | Windows | Linux |
+|------|-------|---------|-------|
+| RockUSB 刷机、升级固件、下载镜像、高级功能 | ✅ | ✅ | ✅ |
+| 安装 APK / 设备日志（内置 ADB） | ✅ | ✅ | — |
+| 替换固件 APK | ✅ | ❌ | ❌ |
+
+替换固件内 APK 依赖 e2fsprogs 工具链（`debugfs`、`e2fsck`）与 libsparse 工具，这些二进制只随 macOS 构建打包，因此 Windows 上会隐藏该页面。
+
+Windows 另有两个前置条件：瑞芯微官方 `Rockusb` 驱动（见下文）和下载好的 ADB platform-tools。
 
 ### 开发
 
@@ -260,6 +309,22 @@ src-tauri/bin/
 
 建议使用 **v2.44+** 版本。Mac 自带旧版（v2.13）对部分新芯片（如 RK3576）支持不完整；需要使用剩余兼容功能时，可从 Linux/Windows SDK 包中获取较新版本替换。
 
+**内置 ADB**
+
+安装 APK 与设备日志页面调用的是内置 ADB，不依赖系统安装的 adb：
+
+| 平台 | 位置 | 来源 |
+|------|------|------|
+| macOS | `src-tauri/resources/platform-tools/macos-arm64/adb` | 已入库 |
+| Windows | `src-tauri/resources/platform-tools/windows-x86_64/`（`adb.exe` 与 `AdbWinApi.dll`、`AdbWinUsbApi.dll`） | 脚本下载，不入库 |
+| Linux | 暂未内置 | — |
+
+Windows 下构建前先执行一次下载脚本（CI 会自动执行），它从 Google 官方 `platform-tools-latest-windows.zip` 提取：
+
+```bash
+packaging/windows/fetch-platform-tools.sh
+```
+
 **本地运行**
 
 ```bash
@@ -277,12 +342,21 @@ npm run tauri build
 
 ### 发布（维护者）
 
-GitHub Actions 在 push `v*` tag 时自动构建三平台安装包并发布 Release：
+GitHub Actions 在 push `v*` tag 时自动构建 macOS 与 Windows 安装包，并发布到同一个 Release（`windows-latest` 产出未签名的 NSIS 安装包，`macos-latest` 产出 Apple Silicon `.dmg`）：
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+Windows 除自动更新签名密钥外无需额外 Secret：
+
+| Secret | 使用方 | 说明 |
+|--------|--------|------|
+| `TAURI_SIGNING_PRIVATE_KEY` | 两个平台 | `tauri signer` 生成的私钥内容（勿提交仓库） |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 两个平台 | 私钥密码，可留空 |
+
+两个 job 都会把自己的平台条目合并进 Release 的 `latest.json`，并用同一个 `concurrency` group 串行执行，避免互相覆盖。Windows 自动更新使用 `tauri.conf.json` 中配置的 NSIS `passive` 安装模式。
 
 macOS 签名与公证需在仓库 Secrets 中配置：
 
