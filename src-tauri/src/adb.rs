@@ -93,6 +93,132 @@ fn run_adb(adb: &PathBuf, serial: &str, args: &[&str]) -> Result<String, String>
     }
 }
 
+/// Fails loudly with the command that broke plus everything the device printed before -
+/// a bare stderr line such as `error: closed` is impossible to diagnose from the log panel.
+fn command_failure(serial: &str, args: &[&str], error: &str, log: &[String]) -> String {
+    let mut message = format!("adb -s {serial} {}", args.join(" "));
+    if !error.is_empty() {
+        message.push('\n');
+        message.push_str(error);
+    }
+    if !log.is_empty() {
+        message.push_str("\n\nPrevious steps:\n");
+        message.push_str(&log.join("\n"));
+    }
+    message
+}
+
+fn run_adb_step(
+    log: &mut Vec<String>,
+    adb: &PathBuf,
+    serial: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    match run_adb(adb, serial, args) {
+        Ok(output) => {
+            if !output.is_empty() {
+                log.push(output);
+            }
+            Ok(())
+        }
+        Err(error) => Err(command_failure(serial, args, &error, log)),
+    }
+}
+
+/// True for transport errors that appear while adbd is still restarting, so the caller can
+/// safely retry instead of giving up.
+fn is_transient_adb_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "device offline",
+        "device not found",
+        "device unauthorized",
+        "no devices/emulators found",
+        "closed",
+        "connection reset",
+        "protocol fault",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Step variant for commands issued right after `reboot`/`root`: adbd needs a moment to
+/// come back, so transient transport errors are retried for up to ~30 s.
+fn run_adb_step_retrying(
+    log: &mut Vec<String>,
+    adb: &PathBuf,
+    serial: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    const ATTEMPTS: u32 = 30;
+    let mut last_error = String::new();
+    for attempt in 0..ATTEMPTS {
+        match run_adb(adb, serial, args) {
+            Ok(output) => {
+                if !output.is_empty() {
+                    log.push(output);
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                if !is_transient_adb_error(&error) {
+                    return Err(command_failure(serial, args, &error, log));
+                }
+                last_error = error;
+            }
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Err(command_failure(serial, args, &last_error, log))
+}
+
+/// Best-effort step: the device output is kept for the log, but a failure does not abort
+/// the flow because some devices legitimately reject the command.
+fn run_adb_optional(log: &mut Vec<String>, adb: &PathBuf, serial: &str, args: &[&str]) -> String {
+    match run_adb(adb, serial, args) {
+        Ok(output) => {
+            if !output.is_empty() {
+                log.push(output.clone());
+            }
+            output
+        }
+        Err(error) => error,
+    }
+}
+
+/// `adb disable-verity` only takes effect after a restart and says so in its output; user
+/// builds and devices without AVB reject the command instead.
+fn verity_needs_reboot(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("already disabled") || lower.contains("only works for userdebug") {
+        return false;
+    }
+    lower.contains("now reboot") || lower.contains("verity disabled")
+}
+
+/// `adb reboot` returns before the device leaves the bus, so an immediate `wait-for-device`
+/// can still be answered by the dying session. Poll a real shell command until adbd is back.
+fn wait_for_reboot(adb: &PathBuf, serial: &str) -> Result<(), String> {
+    const ATTEMPTS: u32 = 90;
+    std::thread::sleep(Duration::from_secs(3));
+    let mut last_error = "the device shell is not ready yet".to_string();
+    for attempt in 0..ATTEMPTS {
+        match run_adb(adb, serial, &["shell", "echo", "ready"]) {
+            Ok(output) if output.contains("ready") => return Ok(()),
+            Ok(_) => {}
+            Err(error) => last_error = error,
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Err(format!(
+        "Timed out waiting for device {serial} to restart: {last_error}"
+    ))
+}
+
 fn emit_log(app: &AppHandle, text: String, level: &str, in_place: bool) {
     let _ = app.emit(
         EVENT_TOOL_LOG,
@@ -259,24 +385,45 @@ pub async fn burn_parameters(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let mut log = Vec::new();
-        log.push(run_adb(&adb, &serial, &["root"])?);
-        log.push(run_adb(&adb, &serial, &["wait-for-device"])?);
-        log.push(run_adb(&adb, &serial, &["remount"])?);
+        run_adb_step(&mut log, &adb, &serial, &["root"])?;
+        run_adb_step(&mut log, &adb, &serial, &["wait-for-device"])?;
+
+        // Android 10+ keeps /system read-only behind dm-verity, and `remount` fails until
+        // verity is disabled - which needs one extra restart. Best effort: user builds and
+        // devices without AVB reject the command, and `remount` below still decides.
+        let verity = run_adb_optional(&mut log, &adb, &serial, &["disable-verity"]);
+        if verity_needs_reboot(&verity) {
+            emit_log(
+                &app,
+                "Restarting the device once to apply the writable /system remount...".to_string(),
+                "default",
+                false,
+            );
+            run_adb_step(&mut log, &adb, &serial, &["reboot"])?;
+            wait_for_reboot(&adb, &serial)?;
+            run_adb_step_retrying(&mut log, &adb, &serial, &["root"])?;
+            run_adb_step_retrying(&mut log, &adb, &serial, &["wait-for-device"])?;
+        }
+
+        run_adb_step(&mut log, &adb, &serial, &["remount"])?;
         let tool_path = tool.to_string_lossy();
-        log.push(run_adb(
+        run_adb_step(
+            &mut log,
             &adb,
             &serial,
             &["push", &tool_path, "/system/bin/read_write_id"],
-        )?);
-        log.push(run_adb(
+        )?;
+        run_adb_step(
+            &mut log,
             &adb,
             &serial,
             &["shell", "chmod", "0777", "/system/bin/read_write_id"],
-        )?);
+        )?;
 
         for parameter in parameters {
             let slot = parameter_slot(&parameter.kind).expect("parameter kind was validated");
-            log.push(run_adb(
+            run_adb_step(
+                &mut log,
                 &adb,
                 &serial,
                 &[
@@ -286,16 +433,15 @@ pub async fn burn_parameters(
                     slot,
                     parameter.value.trim(),
                 ],
-            )?);
+            )?;
         }
 
-        log.push(run_adb(&adb, &serial, &["sync"])?);
-        log.push(run_adb(&adb, &serial, &["reboot"])?);
-        Ok(log
-            .into_iter()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"))
+        // `adb sync` is AOSP's host-side "push build output" command and aborts with
+        // "product directory not specified; set $ANDROID_PRODUCT_OUT". Flush the
+        // device write cache with the device-side `sync` instead.
+        run_adb_step(&mut log, &adb, &serial, &["shell", "sync"])?;
+        run_adb_step(&mut log, &adb, &serial, &["reboot"])?;
+        Ok(log.join("\n"))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -420,8 +566,9 @@ pub async fn reboot_to_loader(
 #[cfg(test)]
 mod tests {
     use super::{
-        adb_control_args, foreground_package, normalize_adb_address, parameter_slot,
-        parse_adb_devices, valid_apk_path,
+        adb_control_args, command_failure, foreground_package, is_transient_adb_error,
+        normalize_adb_address, parameter_slot, parse_adb_devices, valid_apk_path,
+        verity_needs_reboot,
     };
     use std::path::Path;
 
@@ -438,6 +585,34 @@ mod tests {
         assert_eq!(parameter_slot("ds"), Some("9"));
         assert_eq!(parameter_slot("pk"), Some("10"));
         assert_eq!(parameter_slot("unknown"), None);
+    }
+
+    #[test]
+    fn detects_when_disable_verity_requires_a_restart() {
+        assert!(verity_needs_reboot(
+            "Verity disabled on /system\nNow reboot your device for settings to take effect"
+        ));
+        assert!(!verity_needs_reboot("Verity already disabled on /system"));
+        assert!(!verity_needs_reboot(
+            "error: disable-verity only works for userdebug builds"
+        ));
+        assert!(!verity_needs_reboot(""));
+    }
+
+    #[test]
+    fn only_retries_transport_errors() {
+        assert!(is_transient_adb_error("error: device offline"));
+        assert!(is_transient_adb_error("error: closed"));
+        assert!(!is_transient_adb_error("remount failed"));
+    }
+
+    #[test]
+    fn failure_message_keeps_the_failed_command_and_previous_output() {
+        let log = vec!["adbd cannot run as root".to_string()];
+        let message = command_failure("ABC", &["remount"], "remount failed", &log);
+        assert!(message.starts_with("adb -s ABC remount"));
+        assert!(message.contains("remount failed"));
+        assert!(message.contains("adbd cannot run as root"));
     }
 
     #[test]

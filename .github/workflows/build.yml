@@ -28,6 +28,10 @@ on:
 #   push main  → 构建 macOS / Windows 测试包并上传 Artifacts
 #   push v* tag → 构建 macOS / Windows 测试包并发布到同一个 GitHub Release
 #
+# Release 正文取自 docs/releases/v<版本>.md（缺失时回退为占位文案）。
+# tauri-action 会同时把该正文写进 latest.json 的 notes，应用内更新提示读的就是它，
+# 因此发布前务必先提交对应版本的 docs/releases/vX.Y.Z.md。
+#
 # 两个平台都会向 Release 的 latest.json 合并自己的条目，因此共用同一个
 # concurrency group 串行发布，避免并发写覆盖对方的平台条目。
 
@@ -93,6 +97,25 @@ jobs:
           path: src-tauri/target/aarch64-apple-darwin/release/bundle/
           if-no-files-found: error
 
+      # 读取 docs/releases/v<版本>.md 作为 Release 正文（多行 output）。
+      - name: Load release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: release_notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes_file="docs/releases/v${version}.md"
+          if [ -f "$notes_file" ]; then
+            {
+              echo "body<<__RELEASE_NOTES_EOF__"
+              cat "$notes_file"
+              echo "__RELEASE_NOTES_EOF__"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$notes_file not found, falling back to the default release body."
+            echo "body=See the assets to download this version and install." >> "$GITHUB_OUTPUT"
+          fi
+
       # 推送 tag：发布未公证的 Apple Silicon 测试版，并生成自动更新清单与签名。
       - name: Build and release (tag)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -105,7 +128,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: RKDevTool v__VERSION__
-          releaseBody: See the assets to download this version and install.
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
@@ -157,6 +180,25 @@ jobs:
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/
           if-no-files-found: error
 
+      # 读取 docs/releases/v<版本>.md 作为 Release 正文（多行 output）。
+      - name: Load release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: release_notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes_file="docs/releases/v${version}.md"
+          if [ -f "$notes_file" ]; then
+            {
+              echo "body<<__RELEASE_NOTES_EOF__"
+              cat "$notes_file"
+              echo "__RELEASE_NOTES_EOF__"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::$notes_file not found, falling back to the default release body."
+            echo "body=See the assets to download this version and install." >> "$GITHUB_OUTPUT"
+          fi
+
       # 推送 tag：发布未签名的 NSIS 安装包，并把自己的平台条目合并进 latest.json。
       - name: Build and release (tag)
         if: startsWith(github.ref, 'refs/tags/v')
@@ -168,7 +210,7 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: RKDevTool v__VERSION__
-          releaseBody: See the assets to download this version and install.
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
