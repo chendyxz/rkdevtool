@@ -25,28 +25,14 @@ on:
 # 见 https://v2.tauri.app/plugin/updater/
 #
 # 触发规则:
-#   push main  → 仅构建，上传 GitHub Actions Artifacts
-#   push v* tag → 构建并发布 GitHub Release（含 updater artifacts + latest.json）
+#   push main  → 构建 Apple Silicon 测试包并上传 Artifacts
+#   push v* tag → 构建 Apple Silicon 测试包并发布 GitHub Release
 
 jobs:
   publish-tauri:
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: --target aarch64-apple-darwin
-            bundle: src-tauri/target/aarch64-apple-darwin/release/bundle/
-          - platform: ubuntu-22.04
-            args: ""
-            bundle: src-tauri/target/release/bundle/
-          - platform: windows-latest
-            args: --bundles nsis
-            bundle: src-tauri/target/release/bundle/
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
         with:
@@ -61,54 +47,17 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+          targets: aarch64-apple-darwin
 
-      - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      # WiX MSI 依赖 VBScript；GitHub Actions 默认未启用，改用 NSIS 时可跳过
-      - name: Enable VBScript (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: Add-WindowsCapability -Online -Name VBSCRIPT~~~~0.0.1.0
-
-      - name: Import Apple Developer Certificate
-        if: matrix.platform == 'macos-latest'
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          security find-identity -v -p codesigning build.keychain
-
-      - name: Verify Certificate
-        if: matrix.platform == 'macos-latest'
-        run: |
-          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
-          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
-          echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
-          echo "Certificate imported."
-
-      - name: Sign bundled macOS tools
-        if: matrix.platform == 'macos-latest'
+      - name: Ad-hoc sign bundled macOS tools
         run: |
           TOOL="src-tauri/bin/mac/upgrade_tool"
           if [ -f "$TOOL" ]; then
-            codesign --force --options runtime --timestamp --sign "$CERT_ID" "$TOOL"
+            codesign --force --sign - "$TOOL"
             codesign --verify --verbose "$TOOL"
           fi
           for TOOL in src-tauri/resources/firmware-tools/macos-arm64/*; do
-            codesign --force --options runtime --timestamp --sign "$CERT_ID" "$TOOL"
+            codesign --force --sign - "$TOOL"
             codesign --verify --verbose "$TOOL"
           done
           tar -czf src-tauri/resources/firmware-tools/macos-arm64.tar.gz \
@@ -117,48 +66,34 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # 普通 push：只签名构建，不公证（无需 APPLE_ID/PASSWORD）
+      # 未配置 Apple Developer 证书：生成 Apple Silicon 测试包，不签名、不公证。
       - name: Build (push to main)
         if: github.ref == 'refs/heads/main'
         uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          args: ${{ matrix.args }}
+          args: --target aarch64-apple-darwin --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload workflow artifacts
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
-          name: rkdevtool-${{ matrix.platform }}
-          path: ${{ matrix.bundle }}
+          name: rkdevtool-macos-arm64
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/
           if-no-files-found: error
 
-      # 推送 tag：签名 + 公证 + 发布 Release（含 latest.json）
+      # 推送 tag：发布未签名、未公证的 Apple Silicon 测试版。
       - name: Build and release (tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: RKDevTool v__VERSION__
           releaseBody: See the assets to download this version and install.
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
-          updaterJsonPreferNsis: true
-          args: ${{ matrix.args }}
+          includeUpdaterJson: false
+          args: --target aarch64-apple-darwin --config '{"bundle":{"createUpdaterArtifacts":false}}'
