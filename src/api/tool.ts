@@ -24,6 +24,15 @@ export function rebootToLoader(serial: string) {
   return invoke<void>("reboot_to_loader", { serial });
 }
 
+export interface BurnParameter {
+  kind: "voiceKey" | "dn" | "ds" | "pk";
+  value: string;
+}
+
+export function burnParameters(serial: string, toolPath: string, parameters: BurnParameter[]) {
+  return invoke<string>("burn_parameters", { serial, toolPath, parameters });
+}
+
 export function selectDevice(locationId: string | null) {
   return invoke<void>("select_device", { locationId });
 }

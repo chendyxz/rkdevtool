@@ -1,4 +1,4 @@
-export type PageId = "download" | "upgrade" | "apk-update" | "advanced";
+export type PageId = "download" | "upgrade" | "apk-update" | "burn-parameters" | "advanced";
 
 export type LogLevel = "default" | "info" | "success" | "error";
 

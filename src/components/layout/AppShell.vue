@@ -9,6 +9,7 @@ import PageHeader from "./PageHeader.vue";
 import DownloadPage from "../pages/DownloadPage.vue";
 import UpgradePage from "../pages/UpgradePage.vue";
 import ApkUpdatePage from "../pages/ApkUpdatePage.vue";
+import BurnParametersPage from "../pages/BurnParametersPage.vue";
 import AdvancedPage from "../pages/AdvancedPage.vue";
 import { useI18n } from "../../i18n";
 
@@ -28,6 +29,8 @@ const pageTitle = computed(() => {
       return t("page.advanced");
     case "apk-update":
       return t("page.apkUpdate");
+    case "burn-parameters":
+      return t("page.burnParameters");
   }
 });
 </script>
@@ -43,6 +46,7 @@ const pageTitle = computed(() => {
           <DownloadPage v-if="activePage === 'download'" />
           <UpgradePage v-else-if="activePage === 'upgrade'" />
           <ApkUpdatePage v-else-if="activePage === 'apk-update'" />
+          <BurnParametersPage v-else-if="activePage === 'burn-parameters'" />
           <AdvancedPage v-else />
         </div>
       </div>

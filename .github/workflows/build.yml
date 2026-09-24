@@ -21,7 +21,7 @@ on:
 #   TAURI_SIGNING_PRIVATE_KEY          — tauri signer 生成的私钥内容（勿提交仓库）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — 私钥密码（无密码可留空或不设）
 #   公钥写在 src-tauri/tauri.conf.json → plugins.updater.pubkey
-#   更新清单: https://github.com/hiifong/rkdevtool/releases/latest/download/latest.json
+#   更新清单: https://github.com/chendyxz/rkdevtool/releases/latest/download/latest.json
 # 见 https://v2.tauri.app/plugin/updater/
 #
 # 触发规则:
@@ -87,18 +87,20 @@ jobs:
           path: src-tauri/target/aarch64-apple-darwin/release/bundle/
           if-no-files-found: error
 
-      # 推送 tag：发布未签名、未公证的 Apple Silicon 测试版。
+      # 推送 tag：发布未公证的 Apple Silicon 测试版，并生成自动更新清单与签名。
       - name: Build and release (tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: tauri-apps/tauri-action@v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: v__VERSION__
           releaseName: RKDevTool v__VERSION__
           releaseBody: See the assets to download this version and install.
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: false
-          args: --target aarch64-apple-darwin --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: true
+          args: --target aarch64-apple-darwin

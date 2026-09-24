@@ -6,7 +6,7 @@ pub mod firmware;
 mod state;
 mod upgrade_tool;
 
-use adb::{list_adb_devices, reboot_to_loader};
+use adb::{burn_parameters, list_adb_devices, reboot_to_loader};
 use apk_update::update_firmware_apk;
 use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_firmware};
 use firmware::{extract_firmware_file, parse_firmware_info, FirmwareInfo};
@@ -58,6 +58,7 @@ pub fn run() {
             is_tool_busy,
             list_adb_devices,
             reboot_to_loader,
+            burn_parameters,
             update_firmware_apk,
         ])
         .run(tauri::generate_context!())
