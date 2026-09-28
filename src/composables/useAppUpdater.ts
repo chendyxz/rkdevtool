@@ -1,16 +1,54 @@
-import { ref } from "vue";
-import { check } from "@tauri-apps/plugin-updater";
+import { computed, ref, shallowRef } from "vue";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { ask, message } from "@tauri-apps/plugin-dialog";
+import { message } from "@tauri-apps/plugin-dialog";
 import { useI18n } from "../i18n";
 import { GITHUB_REPO_URL } from "../constants/app";
-import { summarizeReleaseNotes } from "../utils/releaseNotes";
+import { plainReleaseNotes, summarizeReleaseNotes } from "../utils/releaseNotes";
+
+export interface UpdatePrompt {
+  version: string;
+  /** 摘要要点：弹窗默认只显示这几条 */
+  summary: string[];
+  /** 完整说明的纯文本，展开后放进可滚动区域 */
+  full: string;
+  /** 摘要被截断时才有展开的必要 */
+  truncated: boolean;
+}
+
+/*
+ * 更新状态挂在模块作用域：侧边栏的“检查更新”按钮和更新弹窗读的是同一份，
+ * 弹窗因此不必层层接 props。
+ */
+const checking = ref(false);
+const updating = ref(false);
+const progressText = ref("");
+const errorText = ref("");
+const prompt = ref<UpdatePrompt | null>(null);
+const pending = shallowRef<Update | null>(null);
+
+/**
+ * 发布说明是 Markdown，动辄几十行。这里备两份：摘要用于默认展示，
+ * 纯文本全文留给“展开完整说明”，两者都不会撑破弹窗。
+ */
+function buildPrompt(update: Update): UpdatePrompt {
+  const digest = summarizeReleaseNotes(update.body);
+  return {
+    version: update.version,
+    summary: digest.text
+      ? digest.text.split("\n").map((line) => line.replace(/^•\s*/, ""))
+      : [],
+    full: plainReleaseNotes(update.body),
+    truncated: digest.truncated,
+  };
+}
 
 export function useAppUpdater() {
   const { t } = useI18n();
-  const checking = ref(false);
-  const updating = ref(false);
-  const progressText = ref("");
+
+  const releaseUrl = computed(() =>
+    prompt.value ? `${GITHUB_REPO_URL}/releases/tag/v${prompt.value.version}` : "",
+  );
 
   async function checkForUpdates({ silent = false }: { silent?: boolean } = {}) {
     if (checking.value || updating.value) return;
@@ -30,31 +68,32 @@ export function useAppUpdater() {
         return;
       }
 
-      // Release notes are Markdown and can be dozens of lines long; the native
-      // dialog only gets a few plain-text bullets plus a link to the full notes.
-      const notes = summarizeReleaseNotes(update.body);
-      const detail = [t("update.available", { version: update.version })];
-      if (notes.text) detail.push(notes.text);
-      if (notes.truncated) {
-        detail.push(
-          t("update.notesMore", {
-            url: `${GITHUB_REPO_URL}/releases/tag/v${update.version}`,
-          }),
-        );
+      pending.value = update;
+      errorText.value = "";
+      prompt.value = buildPrompt(update);
+    } catch (error) {
+      if (!silent) {
+        const detail = error instanceof Error ? error.message : String(error);
+        await message(t("update.failed", { error: detail }), {
+          title: t("update.title"),
+          kind: "error",
+        });
       }
+    } finally {
+      checking.value = false;
+    }
+  }
 
-      const confirmed = await ask(detail.join("\n\n"), {
-        title: t("update.title"),
-        kind: "info",
-        okLabel: t("update.install"),
-        cancelLabel: t("update.later"),
-      });
-      if (!confirmed) return;
+  async function installUpdate() {
+    const update = pending.value;
+    if (!update || updating.value) return;
 
-      updating.value = true;
-      let downloaded = 0;
-      let contentLength = 0;
+    updating.value = true;
+    errorText.value = "";
+    let downloaded = 0;
+    let contentLength = 0;
 
+    try {
       await update.downloadAndInstall((event) => {
         switch (event.event) {
           case "Started":
@@ -82,23 +121,30 @@ export function useAppUpdater() {
 
       await relaunch();
     } catch (error) {
-      if (!silent) {
-        const detail = error instanceof Error ? error.message : String(error);
-        await message(t("update.failed", { error: detail }), {
-          title: t("update.title"),
-          kind: "error",
-        });
-      }
+      // 失败信息留在弹窗里就地重试，比再弹一个原生对话框少一次打断
+      errorText.value = error instanceof Error ? error.message : String(error);
     } finally {
-      checking.value = false;
       updating.value = false;
     }
+  }
+
+  function dismissPrompt() {
+    // 下载/安装期间关掉弹窗会让进度无处可看，此时只能等它跑完
+    if (updating.value) return;
+    prompt.value = null;
+    pending.value = null;
+    errorText.value = "";
   }
 
   return {
     checking,
     updating,
     progressText,
+    errorText,
+    prompt,
+    releaseUrl,
     checkForUpdates,
+    installUpdate,
+    dismissPrompt,
   };
 }

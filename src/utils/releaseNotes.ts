@@ -110,6 +110,37 @@ function pickItems(lines: string[]): string[] {
   return allBullets.length > 0 ? allBullets : plainParagraph(lines);
 }
 
+/**
+ * Whole release notes as plain text for the update dialog's "show everything"
+ * state: headings keep their text, list markers become bullets and inline
+ * markup is dropped, so the result can sit in a scrollable <pre>-like box.
+ */
+export function plainReleaseNotes(body: string | null | undefined): string {
+  const lines: string[] = [];
+
+  for (const raw of (body ?? "").replace(/\r\n?/g, "\n").split("\n")) {
+    const heading = raw.match(HEADING);
+    if (heading) {
+      const text = stripMarkdown(heading[1]);
+      if (text) lines.push(text);
+      continue;
+    }
+
+    const bullet = raw.match(BULLET);
+    if (bullet) {
+      const text = stripMarkdown(bullet[1]);
+      if (text) lines.push(`• ${text}`);
+      continue;
+    }
+
+    // 空行被 stripMarkdown 收成空串，正好把 Markdown 的段间距一并压掉
+    const text = stripMarkdown(raw);
+    if (text) lines.push(text);
+  }
+
+  return lines.join("\n");
+}
+
 export function summarizeReleaseNotes(body: string | null | undefined): ReleaseNotesDigest {
   const lines = (body ?? "").replace(/\r\n?/g, "\n").split("\n");
   const items = pickItems(lines);

@@ -14,6 +14,7 @@ import ApkUpdatePage from "../pages/ApkUpdatePage.vue";
 import BurnParametersPage from "../pages/BurnParametersPage.vue";
 import OtaPackagePage from "../pages/OtaPackagePage.vue";
 import AdvancedPage from "../pages/AdvancedPage.vue";
+import UpdateDialog from "../ui/UpdateDialog.vue";
 import { useI18n } from "../../i18n";
 
 const state = provideAppState();
@@ -68,6 +69,7 @@ const pageTitle = computed(() => {
       <LogPanel v-if="showLogPanel" />
     </div>
     <StatusBar @device-change="onDeviceChange" />
+    <UpdateDialog />
   </div>
 </template>
 
