@@ -22,6 +22,9 @@ const { onDeviceChange } = useDevicePoll(undefined, state);
 useToolBusyPoll(state);
 const { t } = useI18n();
 
+// 设备日志页自带全量日志视图，隐藏右侧日志面板以让出宽度
+const showLogPanel = computed(() => activePage.value !== "logcat");
+
 const pageTitle = computed(() => {
   switch (activePage.value) {
     case "download":
@@ -62,7 +65,7 @@ const pageTitle = computed(() => {
           <AdvancedPage v-else />
         </div>
       </div>
-      <LogPanel />
+      <LogPanel v-if="showLogPanel" />
     </div>
     <StatusBar @device-change="onDeviceChange" />
   </div>

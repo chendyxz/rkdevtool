@@ -16,6 +16,8 @@ pub struct AppState {
     pub logcat_child: Mutex<Option<Child>>,
     pub logcat_lines: Mutex<Vec<String>>,
     pub logcat_generation: Mutex<u64>,
+    /// 最近一次设备截图的 PNG 字节，供预览后另存为时复用
+    pub last_screenshot: Mutex<Option<Vec<u8>>>,
 }
 
 impl Default for AppState {
@@ -28,6 +30,7 @@ impl Default for AppState {
             logcat_child: Mutex::new(None),
             logcat_lines: Mutex::new(Vec::new()),
             logcat_generation: Mutex::new(0),
+            last_screenshot: Mutex::new(None),
         }
     }
 }

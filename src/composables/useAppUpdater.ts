@@ -3,6 +3,8 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import { useI18n } from "../i18n";
+import { GITHUB_REPO_URL } from "../constants/app";
+import { summarizeReleaseNotes } from "../utils/releaseNotes";
 
 export function useAppUpdater() {
   const { t } = useI18n();
@@ -28,12 +30,20 @@ export function useAppUpdater() {
         return;
       }
 
-      const notes = update.body?.trim();
-      const detail = notes
-        ? `${t("update.available", { version: update.version })}\n\n${notes}`
-        : t("update.available", { version: update.version });
+      // Release notes are Markdown and can be dozens of lines long; the native
+      // dialog only gets a few plain-text bullets plus a link to the full notes.
+      const notes = summarizeReleaseNotes(update.body);
+      const detail = [t("update.available", { version: update.version })];
+      if (notes.text) detail.push(notes.text);
+      if (notes.truncated) {
+        detail.push(
+          t("update.notesMore", {
+            url: `${GITHUB_REPO_URL}/releases/tag/v${update.version}`,
+          }),
+        );
+      }
 
-      const confirmed = await ask(detail, {
+      const confirmed = await ask(detail.join("\n\n"), {
         title: t("update.title"),
         kind: "info",
         okLabel: t("update.install"),

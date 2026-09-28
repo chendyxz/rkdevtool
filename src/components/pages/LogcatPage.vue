@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import AppButton from "../ui/AppButton.vue";
 import ScrollBar from "../ui/ScrollBar.vue";
+import ScreenshotDialog from "../ui/ScreenshotDialog.vue";
 import { useAppState } from "../../composables/useAppState";
 import { useI18n } from "../../i18n";
 import { toolApi } from "../../composables/useToolCommand";
@@ -38,9 +39,11 @@ function parseTokens(input: string, lowerCase = true): string[] {
 
 const lines = shallowRef<LogcatEntry[]>([]);
 const running = ref(false);
+const refreshing = ref(false);
 const paused = ref(false);
 const autoScroll = ref(true);
 const fullscreen = ref(false);
+const screenshotOpen = ref(false);
 const level = ref<LogLevel>("");
 const tagInput = ref("");
 const pidInput = ref("");
@@ -189,6 +192,31 @@ async function clear() {
   await toolApi.clearLogcat();
 }
 
+/** 重新从设备拉取日志：丢弃缓存并重启 logcat 流，回到最新状态。 */
+async function refreshLogs() {
+  if (refreshing.value) return;
+  if (!adbSerial.value) {
+    appendLog(t("logcat.noDevice"), "error");
+    return;
+  }
+  refreshing.value = true;
+  try {
+    // 丢弃尚未渲染的缓存行，避免上一轮抓取的日志混进新的一轮
+    pending = [];
+    if (flushTimer !== null) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    paused.value = false;
+    await start();
+    autoScroll.value = true;
+    await nextTick();
+    scrollToBottom();
+  } finally {
+    refreshing.value = false;
+  }
+}
+
 async function exportLogs() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const path = await save({
@@ -206,7 +234,10 @@ async function exportLogs() {
 }
 
 function onKeydown(event: KeyboardEvent) {
-  if (event.key === "Escape" && fullscreen.value) fullscreen.value = false;
+  if (event.key !== "Escape") return;
+  // 截图弹窗已认领这次 Esc（见 ScreenshotDialog 的 preventDefault），别顺手退出全屏
+  if (event.defaultPrevented || screenshotOpen.value) return;
+  if (fullscreen.value) fullscreen.value = false;
 }
 
 onMounted(async () => {
@@ -234,9 +265,13 @@ onUnmounted(() => {
       <div class="logcat-toolbar__actions">
         <AppButton v-if="!running" variant="primary" size="sm" @click="start">{{ t("logcat.start") }}</AppButton>
         <AppButton v-else size="sm" @click="stop">{{ t("logcat.stop") }}</AppButton>
+        <AppButton size="sm" :disabled="refreshing" @click="refreshLogs">{{ t("logcat.refresh") }}</AppButton>
         <AppButton size="sm" @click="paused = !paused">{{ paused ? t("logcat.resume") : t("logcat.pause") }}</AppButton>
         <AppButton size="sm" @click="clear">{{ t("logcat.clear") }}</AppButton>
         <AppButton size="sm" @click="exportLogs">{{ t("logcat.export") }}</AppButton>
+        <AppButton size="sm" :disabled="!adbSerial" @click="screenshotOpen = true">
+          {{ t("logcat.screenshot") }}
+        </AppButton>
         <AppButton size="sm" @click="fullscreen = !fullscreen">
           {{ fullscreen ? t("logcat.exitFullscreen") : t("logcat.fullscreen") }}
         </AppButton>
@@ -296,6 +331,8 @@ onUnmounted(() => {
       </div>
       <ScrollBar :target="viewport" />
     </div>
+
+    <ScreenshotDialog v-if="screenshotOpen" :serial="adbSerial" @close="screenshotOpen = false" />
   </div>
 </template>
 

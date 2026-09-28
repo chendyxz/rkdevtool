@@ -563,11 +563,79 @@ pub async fn reboot_to_loader(
     Err("Timed out waiting for the RockUSB Loader device".to_string())
 }
 
+/// PNG 文件头，用来确认 `screencap` 真的回传了一张图片而不是错误文本。
+const PNG_SIGNATURE: [u8; 4] = [0x89, b'P', b'N', b'G'];
+
+/// 抓一帧设备画面。
+///
+/// 用 `exec-out` 让 adb 把 PNG 原样写到 stdout，不在设备 `/sdcard` 上留临时文件；
+/// 通过 `Command::output()` 读字节，Windows 上也不会被文本模式改写换行。
+fn capture_png(adb: &PathBuf, serial: &str) -> Result<Vec<u8>, String> {
+    let output = adb_command(adb)
+        .args(["-s", serial, "exec-out", "screencap", "-p"])
+        .output()
+        .map_err(|e| format!("Failed to run adb: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "Failed to capture the device screen".to_string()
+        } else {
+            stderr
+        });
+    }
+    if !looks_like_png(&output.stdout) {
+        return Err("The device did not return a PNG screenshot".to_string());
+    }
+    Ok(output.stdout)
+}
+
+fn looks_like_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(&PNG_SIGNATURE)
+}
+
+/// 截图并以原始字节返回（前端拿到 ArrayBuffer 直接预览），同时缓存一份供另存为使用。
+#[tauri::command]
+pub async fn capture_screenshot(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    serial: String,
+) -> Result<tauri::ipc::Response, String> {
+    let adb = adb_path(&app)?;
+    let png = tauri::async_runtime::spawn_blocking(move || capture_png(&adb, &serial))
+        .await
+        .map_err(|e| e.to_string())??;
+    *state
+        .last_screenshot
+        .lock()
+        .map_err(|e| e.to_string())? = Some(png.clone());
+    Ok(tauri::ipc::Response::new(png))
+}
+
+/// 把最近一次截图写到用户选定的路径。
+///
+/// 前端手里只有 ArrayBuffer，回传会退化成 JSON 数字数组（几 MB 的图要几十 MB 文本），
+/// 所以字节留在 Rust 侧，保存时只传路径。
+#[tauri::command]
+pub async fn save_screenshot(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let png = state
+        .last_screenshot
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+        .ok_or_else(|| "No screenshot to save".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&path, png).map_err(|e| format!("Failed to save the screenshot: {e}"))?;
+        Ok(path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         adb_control_args, command_failure, foreground_package, is_transient_adb_error,
-        normalize_adb_address, parameter_slot, parse_adb_devices, valid_apk_path,
+        looks_like_png, normalize_adb_address, parameter_slot, parse_adb_devices, valid_apk_path,
         verity_needs_reboot,
     };
     use std::path::Path;
@@ -597,6 +665,14 @@ mod tests {
             "error: disable-verity only works for userdebug builds"
         ));
         assert!(!verity_needs_reboot(""));
+    }
+
+    #[test]
+    fn accepts_only_png_screenshot_bytes() {
+        assert!(looks_like_png(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a]));
+        // adb 报错时 stdout 可能是空串或一段错误文本
+        assert!(!looks_like_png(b""));
+        assert!(!looks_like_png(b"error: device offline"));
     }
 
     #[test]

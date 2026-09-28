@@ -10,8 +10,8 @@ mod state;
 mod upgrade_tool;
 
 use adb::{
-    burn_parameters, connect_adb_device, install_apk, list_adb_devices, reboot_to_loader,
-    run_adb_control,
+    burn_parameters, capture_screenshot, connect_adb_device, install_apk, list_adb_devices,
+    reboot_to_loader, run_adb_control, save_screenshot,
 };
 use apk_update::update_firmware_apk;
 use device_ops::{download_boot, get_current_storage, read_chip_info, upgrade_firmware};
@@ -75,6 +75,8 @@ pub fn run() {
             install_apk,
             run_adb_control,
             burn_parameters,
+            capture_screenshot,
+            save_screenshot,
             start_logcat,
             stop_logcat,
             clear_logcat,

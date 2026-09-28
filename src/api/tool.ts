@@ -52,6 +52,16 @@ export function exportLogcat(path: string) {
   return invoke<number>("export_logcat", { path });
 }
 
+/** 截图返回原始 PNG 字节（Tauri 的 Raw 响应在 JS 侧就是 ArrayBuffer）。 */
+export function captureScreenshot(serial: string) {
+  return invoke<ArrayBuffer>("capture_screenshot", { serial });
+}
+
+/** 保存的是 Rust 侧缓存的最近一张截图，无需回传字节。 */
+export function saveScreenshot(path: string) {
+  return invoke<string>("save_screenshot", { path });
+}
+
 export interface BurnParameter {
   kind: "voiceKey" | "dn" | "ds" | "pk";
   value: string;
